@@ -1,8 +1,21 @@
-<!doctype html>
-<html>
-  <body>
-    <h1>Lakehouse Booking</h1>
-    <p>Welcome! Submit requests here (feature stub).</p>
-    <a href="/admin">Admin</a>
-  </body>
-</html>
+{% extends "base.html" %}
+{% block content %}
+<h2>Request time at the Lake House</h2>
+<p class="tag">Dues-paying members are prioritized in review.</p>
+
+<form method="POST">
+  {{ form.hidden_tag() }}
+  <div class="grid">
+    <label>{{ form.name.label }} {{ form.name(size=32) }}</label>
+    <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
+    <label>{{ form.phone.label }} {{ form.phone(size=20) }}</label>
+    <label>{{ form.member_type.label }} {{ form.member_type() }}</label>
+    <label>{{ form.start_date.label }} {{ form.start_date() }}</label>
+    <label>{{ form.end_date.label }} {{ form.end_date() }}</label>
+  </div>
+  <label>{{ form.notes.label }} {{ form.notes(rows=3, placeholder="Anything we should know?") }}</label>
+  <label>{{ form.subscribe_sms() }} {{ form.subscribe_sms.label }}</label>
+  <button type="submit">Submit Request</button>
+</form>
+{% endblock %}
+
