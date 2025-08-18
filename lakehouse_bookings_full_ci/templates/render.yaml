@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: lakehouse-bookings
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -b 0.0.0.0:5000 app:app
+    envVars:
+      - key: FLASK_SECRET_KEY
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: GOOGLE_CALENDAR_ID
+        sync: false
+
