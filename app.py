@@ -6,7 +6,7 @@ app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret")
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("home.html")
 
 @app.route("/admin")
 def admin():
