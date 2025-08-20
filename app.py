@@ -217,6 +217,16 @@ def _notify_status(br: BookingRequest):
 # -----------------------------
 # Routes — resilient homepage
 # -----------------------------
+
+@app.before_request
+def _ensure_db():
+    # Only run once per process
+    if not getattr(app, "_db_inited", False):
+        with app.app_context():
+            db.create_all()
+        app._db_inited = True
+
+
 @app.route("/", methods=["GET", "POST"])
 def home():
     # If template exists, render full booking form; else inline fallback so site always loads
@@ -259,8 +269,7 @@ def home():
             )
             send_email(
                 member.email,
-                "We received your lake house request",
-                f"Hi {member.name},\n\nWe received your request for {br.start_date} to {br.end_date}. We'll notify you once it's approved or denied.\n\nThanks!"
+                "We received your lake house request", "Hi {member.name},\n\nWe received your request for {br.start_date} to {br.end_date}. We'll notify you once it's approved or denied.\n\nThanks!"
             )
             if form.subscribe_sms.data and member.phone:
                 send_sms(member.phone, f"Lake House: request received for {br.start_date} - {br.end_date}.")
