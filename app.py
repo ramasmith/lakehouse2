@@ -2,6 +2,7 @@
 import os, sys
 from pathlib import Path
 from datetime import datetime, date, timedelta
+from urllib.parse import quote
 
 from flask import (
     Flask, render_template, render_template_string, request,
@@ -97,6 +98,13 @@ DEFAULT_TEMPLATES = {
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Lake House Bookings</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <style>
+    .badge { padding: 0.2rem 0.4rem; border-radius: 4px; font-size: 0.75rem; }
+    .badge.due { background: #0ea5e9; color: white; }
+    .badge.non_due { background: #94a3b8; color: white; }
+    .tag { font-size: 0.75rem; padding: 0.15rem 0.35rem; border-radius: 999px; background: #e2e8f0; color:#334155; }
+    code { font-size: 0.8rem; }
+  </style>
 </head>
 <body>
   <main class="container">
@@ -104,8 +112,14 @@ DEFAULT_TEMPLATES = {
       <ul><li><strong>Lake House Bookings</strong></li></ul>
       <ul>
         <li><a href="{{ url_for('home') }}">Request</a></li>
-        <li><a href="{{ url_for('admin_login') }}">Admin</a></li>
+        <li><a href="{{ url_for('calendar_view') }}">Calendar</a></li>
         <li><a href="{{ url_for('calendar_ics') }}">ICS feed</a></li>
+        {% if session.get('is_admin') %}
+          <li><a href="{{ url_for('admin_requests') }}">Admin</a></li>
+          <li><a href="{{ url_for('admin_logout') }}">Logout</a></li>
+        {% else %}
+          <li><a href="{{ url_for('admin_login') }}">Admin</a></li>
+        {% endif %}
       </ul>
     </nav>
     {% with messages = get_flashed_messages(with_categories=true) %}
@@ -118,6 +132,9 @@ DEFAULT_TEMPLATES = {
       {% endif %}
     {% endwith %}
     {% block content %}{% endblock %}
+    <footer style="margin-top:3rem; font-size:0.9rem; color:#64748b;">
+      Built with Flask • Conflict detection • Dues priority • Audit log • ICS feed
+    </footer>
   </main>
 </body></html>""",
 
@@ -229,6 +246,26 @@ DEFAULT_TEMPLATES = {
 <p>No denied requests.</p>
 {% endif %}
 {% endblock %}""",
+
+    "calendar_embed.html": """{% extends "base.html" %}
+{% block content %}
+<h2>Lake House Calendar</h2>
+{% if embed_src %}
+  <iframe
+    src="{{ embed_src }}"
+    style="border:0; width:100%; height:75vh;"
+    frameborder="0" scrolling="no">
+  </iframe>
+  <p style="margin-top:0.75rem;">
+    Need an ICS? <a href="{{ url_for('calendar_ics') }}">Subscribe to the iCal feed</a>.
+  </p>
+{% else %}
+  <article class="warning">
+    <strong>Calendar not configured.</strong>
+    <p>Set <code>GOOGLE_CALENDAR_EMBED_ID</code> (recommended) or <code>GOOGLE_CALENDAR_ID</code> in Render, then redeploy.</p>
+  </article>
+{% endif %}
+{% endblock %}""",
 }
 
 def _ensure_templates_present():
@@ -244,7 +281,7 @@ def _ensure_templates_present():
 
 _ensure_templates_present()
 # --- END SELF-HEALING TEMPLATES ---
- 
+
 # -----------------------------
 # Helpers: Email, SMS, Calendar
 # -----------------------------
@@ -291,14 +328,12 @@ def _get_google_creds():
             if creds.refresh_token:
                 try:
                     creds.refresh(Request())
-                    # persist refreshed token
                     with open(token_path, "w") as f:
                         f.write(creds.to_json())
                 except Exception as e:
                     print(f"[Calendar] Refresh failed: {e}")
                     return None
         return creds
-    # No token.json on server — skip (don’t try browser flow)
     print("[Calendar] token.json not found; skipping calendar sync on server.")
     return None
 
@@ -420,7 +455,6 @@ def home():
                 f"{member.name} ({member.member_type}) requested {br.start_date} - {br.end_date}.\n"
                 f"Notes: {br.notes or '(none)'}\nReview: {request.url_root}admin/requests"
             )
-            # FIXED: was missing f-string before
             send_email(
                 member.email,
                 "We received your lake house request",
@@ -444,7 +478,6 @@ def home():
         <p><a href="/_diag">Diagnostics</a></p>
       </body></html>
     """)
-from urllib.parse import quote
 
 @app.route("/calendar")
 def calendar_view():
@@ -525,173 +558,4 @@ def admin_requests():
               .order_by(BookingRequest.created_at.desc())
               .all())
     return render_template("admin_requests.html",
-                           pending=pending, approved=approved, denied=denied,
-                           logs=AuditLog.query.order_by(AuditLog.created_at.desc()).limit(50).all())
-
-# Admin diag
-@app.route("/admin/_diag")
-def admin_diag():
-    raw = os.getenv("ADMIN_EMAIL", "")
-    masked = (raw[:2] + "***" + raw[-2:]) if len(raw) >= 5 else ("***" if raw else "")
-    return {
-        "has_secret_key": bool(app.config.get("SECRET_KEY")),
-        "has_admin_email": bool(os.getenv("ADMIN_EMAIL")),
-        "admin_email_masked": masked,
-        "has_admin_password": bool(os.getenv("ADMIN_PASSWORD")),
-    }, 200
-
-# Files diag
-@app.route("/_ls")
-def _ls():
-    tree = []
-    for root, dirs, files in os.walk(".", topdown=True):
-        if "/.venv" in root or "/site-packages" in root:
-            continue
-        tree.append({"root": root, "dirs": sorted(dirs), "files": sorted(files)})
-    return {"cwd": os.getcwd(), "tree": tree}, 200
-
-# Actions
-@app.post("/admin/requests/<int:req_id>/approve")
-def approve_request(req_id):
-    if not is_admin():
-        return redirect(url_for("admin_login"))
-    br = BookingRequest.query.get_or_404(req_id)
-    conflicts = find_conflicts(br.start_date, br.end_date, exclude_request_id=br.id)
-    if conflicts:
-        conflict_list = ", ".join([f"{c.member.name}({c.start_date}→{c.end_date})" for c in conflicts])
-        flash(f"Cannot approve: date conflict with {conflict_list}.", "danger")
-        return redirect(url_for("admin_requests"))
-    br.status = "approved"
-    summary = f"Lake House: {br.member.name} ({br.member.member_type})"
-    description = (br.notes or "") + f"\nMember email: {br.member.email}"
-    event_id = add_event_to_calendar(summary, br.start_date, br.end_date, description)
-    if event_id:
-        br.calendar_event_id = event_id
-    db.session.commit()
-    _notify_status(br)
-    _log("approve", br.id, "Approved and synced to calendar")
-    flash("Request approved and calendar updated.", "success")
-    return redirect(url_for("admin_requests"))
-
-@app.post("/admin/requests/<int:req_id>/deny")
-def deny_request(req_id):
-    if not is_admin():
-        return redirect(url_for("admin_login"))
-    br = BookingRequest.query.get_or_404(req_id)
-    br.status = "denied"
-    if br.calendar_event_id:
-        remove_event_from_calendar(br.calendar_event_id)
-        br.calendar_event_id = None
-    db.session.commit()
-    _notify_status(br)
-    _log("deny", br.id, "Denied by admin")
-    flash("Request denied.", "info")
-    return redirect(url_for("admin_requests"))
-
-@app.post("/admin/requests/<int:req_id>/cancel")
-def cancel_request(req_id):
-    if not is_admin():
-        return redirect(url_for("admin_login"))
-    br = BookingRequest.query.get_or_404(req_id)
-    br.status = "cancelled"
-    if br.calendar_event_id:
-        remove_event_from_calendar(br.calendar_event_id)
-        br.calendar_event_id = None
-    db.session.commit()
-    _notify_status(br)
-    _log("cancel", br.id, "Cancelled by admin")
-    flash("Request cancelled and calendar updated.", "warning")
-    return redirect(url_for("admin_requests"))
-
-# Public read-only ICS feed
-@app.route("/calendar.ics")
-def calendar_ics():
-    events = (BookingRequest.query
-              .filter(BookingRequest.status == "approved")
-              .order_by(BookingRequest.start_date.asc())
-              .all())
-    def esc(s): return (s or "").replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
-    def fold(line, limit=75):
-        if len(line) <= limit: return [line]
-        out = []
-        while len(line) > limit:
-            out.append(line[:limit]); line = " " + line[limit:]
-        out.append(line); return out
-
-    lines = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//LakeHouse//Bookings//EN",
-        "CALSCALE:GREGORIAN",
-        "METHOD:PUBLISH",
-        "X-WR-CALNAME:Lake House Bookings",
-    ]
-    for r in events:
-        uid = f"lakehouse-{r.id}@example.local"
-        dtstamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-        dtstart = r.start_date.strftime("%Y%m%d")
-        dtend = (r.end_date + timedelta(days=1)).strftime("%Y%m%d")
-        summary = esc(f"Lake House: {r.member.name} ({r.member.member_type})")
-        desc = esc((r.notes or "") + f"\\nMember email: {r.member.email}")
-        ev = [
-            "BEGIN:VEVENT",
-            f"UID:{uid}",
-            f"DTSTAMP:{dtstamp}",
-            f"DTSTART;VALUE=DATE:{dtstart}",
-            f"DTEND;VALUE=DATE:{dtend}",
-            f"SUMMARY:{summary}",
-            f"DESCRIPTION:{desc}",
-            "END:VEVENT",
-        ]
-        for line in ev: lines.extend(fold(line))
-    ics = "\\r\\n".join(lines + ["END:VCALENDAR"]) + "\\r\\n"
-    return Response(ics, mimetype="text/calendar")
-
-# Diagnostics
-@app.route("/_diag")
-def _diag():
-    try:
-        return jsonify({
-            "cwd": os.getcwd(),
-            "python_version": sys.version,
-            "base_dir": str(BASE_DIR),
-            "template_dir": str(TEMPLATES_DIR),
-            "has_templates_dir": TEMPLATES_DIR.is_dir(),
-            "templates_list": sorted(p.name for p in TEMPLATES_DIR.glob("*")) if TEMPLATES_DIR.is_dir() else [],
-            "files_in_cwd": sorted(os.listdir(".")),
-        })
-    except Exception as e:
-        return {"error": repr(e)}, 500
-
-# Reminders (opt-in: set ENABLE_SCHEDULER=1)
-def send_upcoming_reminders():
-    today = date.today()
-    in_two_days = today + timedelta(days=2)
-    upcoming = BookingRequest.query.filter(
-        BookingRequest.status == "approved",
-        BookingRequest.start_date == in_two_days
-    ).all()
-    for br in upcoming:
-        send_email(
-            br.member.email,
-            "Lake House reminder",
-            f"Hi {br.member.name}, your lake house stay starts on {br.start_date}. Enjoy!"
-        )
-        if br.member.phone:
-            send_sms(br.member.phone, f"Reminder: your lake house stay starts on {br.start_date}.")
-
-if os.getenv("ENABLE_SCHEDULER", "0") == "1":
-    scheduler = BackgroundScheduler(daemon=True)
-    scheduler.add_job(send_upcoming_reminders, "cron", hour=9, minute=0)
-    scheduler.start()
-
-@app.cli.command("init-db")
-def init_db():
-    db.create_all()
-    print("Database initialized.")
-
-if __name__ == "__main__":
-    with app.app_context():
-        db.create_all()
-    app.run(host="0.0.0.0", port=5000)
-
+                           pending
