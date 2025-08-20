@@ -90,6 +90,161 @@ class AdminLoginForm(FlaskForm):
     password = PasswordField("Password", validators=[DataRequired()])
     submit = SubmitField("Sign in")
 
+# --- SELF-HEALING TEMPLATES (prevents TemplateNotFound on Render) ---
+DEFAULT_TEMPLATES = {
+    "base.html": """<!doctype html>
+<html lang="en"><head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lake House Bookings</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+</head>
+<body>
+  <main class="container">
+    <nav>
+      <ul><li><strong>Lake House Bookings</strong></li></ul>
+      <ul>
+        <li><a href="{{ url_for('home') }}">Request</a></li>
+        <li><a href="{{ url_for('admin_login') }}">Admin</a></li>
+        <li><a href="{{ url_for('calendar_ics') }}">ICS feed</a></li>
+      </ul>
+    </nav>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div>
+          {% for category, message in messages %}
+            <article class="{{ category }}">{{ message }}</article>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+    {% block content %}{% endblock %}
+  </main>
+</body></html>""",
+
+    "home.html": """{% extends "base.html" %}
+{% block content %}
+<h2>Request time at the Lake House</h2>
+<form method="POST">
+  {{ form.hidden_tag() }}
+  <div class="grid">
+    <label>{{ form.name.label }} {{ form.name(size=32) }}</label>
+    <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
+    <label>{{ form.phone.label }} {{ form.phone(size=20) }}</label>
+    <label>{{ form.member_type.label }} {{ form.member_type() }}</label>
+    <label>{{ form.start_date.label }} {{ form.start_date() }}</label>
+    <label>{{ form.end_date.label }} {{ form.end_date() }}</label>
+  </div>
+  <label>{{ form.notes.label }} {{ form.notes(rows=3) }}</label>
+  <label>{{ form.subscribe_sms() }} {{ form.subscribe_sms.label }}</label>
+  <button type="submit">Submit Request</button>
+</form>
+{% endblock %}""",
+
+    "admin_login.html": """{% extends "base.html" %}
+{% block content %}
+<h2>Admin Login</h2>
+{% if form.errors %}
+  <article class="warning">
+    <strong>Form errors:</strong>
+    <ul>
+      {% for field, errs in form.errors.items() %}
+        {% for e in errs %}<li>{{ field }}: {{ e }}</li>{% endfor %}
+      {% endfor %}
+    </ul>
+  </article>
+{% endif %}
+<form method="POST">
+  {{ form.hidden_tag() }}
+  <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
+  <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
+  <button type="submit">Sign in</button>
+</form>
+{% endblock %}""",
+
+    "admin_requests.html": """{% extends "base.html" %}
+{% block content %}
+<h2>Pending Requests</h2>
+{% if pending %}
+<table role="grid">
+  <thead><tr><th>Member</th><th>Dates</th><th>Notes</th><th>Actions</th></tr></thead>
+  <tbody>
+  {% for r in pending %}
+    <tr>
+      <td>{{ r.member.name }} ({{ r.member.member_type }})<br><small>{{ r.member.email }}</small></td>
+      <td>{{ r.start_date }} → {{ r.end_date }}</td>
+      <td>{{ r.notes }}</td>
+      <td>
+        <form method="POST" action="{{ url_for('approve_request', req_id=r.id) }}" style="display:inline;">
+          <button>Approve</button>
+        </form>
+        <form method="POST" action="{{ url_for('deny_request', req_id=r.id) }}" style="display:inline;">
+          <button class="secondary">Deny</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No pending requests.</p>
+{% endif %}
+
+<h2>Approved</h2>
+{% if approved %}
+<table role="grid">
+  <thead><tr><th>Member</th><th>Dates</th><th>Calendar</th><th>Actions</th></tr></thead>
+  <tbody>
+  {% for r in approved %}
+    <tr>
+      <td>{{ r.member.name }} ({{ r.member.member_type }})</td>
+      <td>{{ r.start_date }} → {{ r.end_date }}</td>
+      <td>{% if r.calendar_event_id %}<code>{{ r.calendar_event_id }}</code>{% else %}-{% endif %}</td>
+      <td>
+        <form method="POST" action="{{ url_for('deny_request', req_id=r.id) }}" style="display:inline;">
+          <button class="secondary">Revoke</button>
+        </form>
+        <form method="POST" action="{{ url_for('cancel_request', req_id=r.id) }}" style="display:inline;">
+          <button class="contrast">Cancel</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No approved bookings.</p>
+{% endif %}
+
+<h2>Denied</h2>
+{% if denied %}
+<table role="grid">
+  <thead><tr><th>Member</th><th>Dates</th><th>Notes</th></tr></thead>
+  <tbody>
+  {% for r in denied %}
+    <tr><td>{{ r.member.name }}</td><td>{{ r.start_date }} → {{ r.end_date }}</td><td>{{ r.notes }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No denied requests.</p>
+{% endif %}
+{% endblock %}""",
+}
+
+def _ensure_templates_present():
+    try:
+        TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+        for name, content in DEFAULT_TEMPLATES.items():
+            p = TEMPLATES_DIR / name
+            if not p.exists():
+                p.write_text(content, encoding="utf-8")
+                app.logger.info(f"[bootstrap] wrote missing template: {p}")
+    except Exception as e:
+        app.logger.error(f"[bootstrap] failed creating templates: {e}")
+
+_ensure_templates_present()
+# --- END SELF-HEALING TEMPLATES ---
+ 
 # -----------------------------
 # Helpers: Email, SMS, Calendar
 # -----------------------------
