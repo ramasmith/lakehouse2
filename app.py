@@ -321,6 +321,17 @@ def admin_diag():
         "admin_email_masked": masked,
         "has_admin_password": bool(os.getenv("ADMIN_PASSWORD")),
     }, 200
+
+@app.route("/_ls")
+def _ls():
+    import os
+    tree = []
+    for root, dirs, files in os.walk(".", topdown=True):
+        # keep output small
+        if "/.venv" in root or "/site-packages" in root:
+            continue
+        tree.append({"root": root, "dirs": sorted(dirs), "files": sorted(files)})
+    return {"cwd": os.getcwd(), "tree": tree}, 200
     
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
