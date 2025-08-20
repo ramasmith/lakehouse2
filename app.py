@@ -444,6 +444,23 @@ def home():
         <p><a href="/_diag">Diagnostics</a></p>
       </body></html>
     """)
+from urllib.parse import quote
+
+@app.route("/calendar")
+def calendar_view():
+    # Prefer a dedicated embed ID if you have one; else fall back to GOOGLE_CALENDAR_ID
+    cal_id = os.getenv("GOOGLE_CALENDAR_EMBED_ID") or os.getenv("GOOGLE_CALENDAR_ID")
+    embed_src = None
+    if cal_id:
+        # Embed URL docs: https://support.google.com/calendar/answer/41207
+        embed_src = (
+            "https://calendar.google.com/calendar/embed"
+            f"?src={quote(cal_id)}"
+            "&ctz=America%2FNew_York"
+            "&mode=MONTH"              # MONTH | WEEK | AGENDA
+            "&showPrint=0&showTitle=0" # tidy look
+        )
+    return render_template("calendar_embed.html", embed_src=embed_src, calendar_id=cal_id)
 
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
