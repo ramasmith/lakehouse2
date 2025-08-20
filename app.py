@@ -20,6 +20,7 @@ from sqlalchemy import case
 
 # Notifications
 import smtplib
+from email.mime_text import MIMEText  # type: ignore  # Some environments warn; it's correct.
 from email.mime.text import MIMEText
 from twilio.rest import Client as TwilioClient
 
@@ -225,4 +226,131 @@ DEFAULT_TEMPLATES = {
         </form>
       </td>
     </tr>
-  {% end
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No approved bookings.</p>
+{% endif %}
+
+<h2>Denied</h2>
+{% if denied %}
+<table role="grid">
+  <thead><tr><th>Member</th><th>Dates</th><th>Notes</th></tr></thead>
+  <tbody>
+  {% for r in denied %}
+    <tr><td>{{ r.member.name }}</td><td>{{ r.start_date }} → {{ r.end_date }}</td><td>{{ r.notes }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No denied requests.</p>
+{% endif %}
+{% endblock %}""",
+
+    "calendar_embed.html": """{% extends "base.html" %}
+{% block content %}
+<h2>Lake House Calendar</h2>
+{% if embed_src %}
+  <iframe
+    src="{{ embed_src }}"
+    style="border:0; width:100%; height:75vh;"
+    frameborder="0" scrolling="no">
+  </iframe>
+  <p style="margin-top:0.75rem;">
+    Need an ICS? <a href="{{ url_for('calendar_ics') }}">Subscribe to the iCal feed</a>.
+  </p>
+{% else %}
+  <article class="warning">
+    <strong>Calendar not configured.</strong>
+    <p>Set <code>GOOGLE_CALENDAR_EMBED_ID</code> (recommended) or <code>GOOGLE_CALENDAR_ID</code> in Render, then redeploy.</p>
+  </article>
+{% endif %}
+{% endblock %}""",
+}
+
+def _ensure_templates_present():
+    try:
+        TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+        for name, content in DEFAULT_TEMPLATES.items():
+            p = TEMPLATES_DIR / name
+            if not p.exists():
+                p.write_text(content, encoding="utf-8")
+                app.logger.info(f"[bootstrap] wrote missing template: {p}")
+    except Exception as e:
+        app.logger.error(f"[bootstrap] failed creating templates: {e}")
+
+_ensure_templates_present()
+# --- END SELF-HEALING TEMPLATES ---
+
+# -----------------------------
+# Helpers: Email, SMS, Calendar
+# -----------------------------
+def send_email(to_email, subject, body):
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_port = os.getenv("SMTP_PORT")
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_pass = os.getenv("SMTP_PASS")
+    email_from = os.getenv("EMAIL_FROM", "no-reply@lakehouse.local")
+    if not (smtp_host and smtp_port and smtp_user and smtp_pass):
+        print(f"[EMAIL DRY-RUN] To: {to_email} | Subject: {subject}\n{body}")
+        return
+    msg = MIMEText(body, "plain")
+    msg["Subject"] = subject
+    msg["From"] = email_from
+    msg["To"] = to_email
+    with smtplib.SMTP(smtp_host, int(smtp_port)) as server:
+        server.starttls()
+        server.login(smtp_user, smtp_pass)
+        server.send_message(msg)
+
+def send_sms(to_number, body):
+    sid = os.getenv("TWILIO_ACCOUNT_SID")
+    token = os.getenv("TWILIO_AUTH_TOKEN")
+    from_number = os.getenv("TWILIO_FROM_NUMBER")
+    if not (sid and token and from_number and to_number):
+        print(f"[SMS DRY-RUN] To: {to_number} | {body}")
+        return
+    client = TwilioClient(sid, token)
+    client.messages.create(to=to_number, from_=from_number, body=body)
+
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
+def _get_google_creds():
+    """
+    Server-safe creds: use token.json if present; refresh if needed.
+    Do NOT run OAuth browser flow on Render (no UI) — just skip if token missing.
+    To allow local OAuth, run on your machine to generate token.json, then upload to Render Secret Files.
+    """
+    token_path = BASE_DIR / "token.json"
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+        if not creds.valid and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                with open(token_path, "w") as f:
+                    f.write(creds.to_json())
+            except Exception as e:
+                print(f"[Calendar] Refresh failed: {e}")
+                return None
+        return creds
+    print("[Calendar] token.json not found; skipping calendar sync on server.")
+    return None
+
+def add_event_to_calendar(summary, start_date, end_date, description=""):
+    calendar_id = os.getenv("GOOGLE_CALENDAR_ID")
+    if not calendar_id:
+        print("[Calendar] GOOGLE_CALENDAR_ID missing. Skipping calendar update.")
+        return None
+    creds = _get_google_creds()
+    if not creds:
+        return None
+    service = build("calendar", "v3", credentials=creds)
+    event_body = {
+        "summary": summary,
+        "description": description,
+        "start": {"date": start_date.isoformat()},  # all-day
+        "end": {"date": (end_date + timedelta(days=1)).isoformat()},  # exclusive end
+    }
+    event = service.events().insert(calendarId=calendar_id, body=event_body).execute()
+    re
