@@ -558,4 +558,172 @@ def admin_requests():
               .order_by(BookingRequest.created_at.desc())
               .all())
     return render_template("admin_requests.html",
-                           pending
+                           pending=pending, approved=approved, denied=denied,
+                           logs=AuditLog.query.order_by(AuditLog.created_at.desc()).limit(50).all())
+
+# Admin diag
+@app.route("/admin/_diag")
+def admin_diag():
+    raw = os.getenv("ADMIN_EMAIL", "")
+    masked = (raw[:2] + "***" + raw[-2:]) if len(raw) >= 5 else ("***" if raw else "")
+    return {
+        "has_secret_key": bool(app.config.get("SECRET_KEY")),
+        "has_admin_email": bool(os.getenv("ADMIN_EMAIL")),
+        "admin_email_masked": masked,
+        "has_admin_password": bool(os.getenv("ADMIN_PASSWORD")),
+    }, 200
+
+# Files diag
+@app.route("/_ls")
+def _ls():
+    tree = []
+    for root, dirs, files in os.walk(".", topdown=True):
+        if "/.venv" in root or "/site-packages" in root:
+            continue
+        tree.append({"root": root, "dirs": sorted(dirs), "files": sorted(files)})
+    return {"cwd": os.getcwd(), "tree": tree}, 200
+
+# Actions
+@app.post("/admin/requests/<int:req_id>/approve")
+def approve_request(req_id):
+    if not is_admin():
+        return redirect(url_for("admin_login"))
+    br = BookingRequest.query.get_or_404(req_id)
+    conflicts = find_conflicts(br.start_date, br.end_date, exclude_request_id=br.id)
+    if conflicts:
+        conflict_list = ", ".join([f"{c.member.name}({c.start_date}→{c.end_date})" for c in conflicts])
+        flash(f"Cannot approve: date conflict with {conflict_list}.", "danger")
+        return redirect(url_for("admin_requests"))
+    br.status = "approved"
+    summary = f"Lake House: {br.member.name} ({br.member.member_type})"
+    description = (br.notes or "") + f"\nMember email: {br.member.email}"
+    event_id = add_event_to_calendar(summary, br.start_date, br.end_date, description)
+    if event_id:
+        br.calendar_event_id = event_id
+    db.session.commit()
+    _notify_status(br)
+    _log("approve", br.id, "Approved and synced to calendar")
+    flash("Request approved and calendar updated.", "success")
+    return redirect(url_for("admin_requests"))
+
+@app.post("/admin/requests/<int:req_id>/deny")
+def deny_request(req_id):
+    if not is_admin():
+        return redirect(url_for("admin_login"))
+    br = BookingRequest.query.get_or_404(req_id)
+    br.status = "denied"
+    if br.calendar_event_id:
+        remove_event_from_calendar(br.calendar_event_id)
+        br.calendar_event_id = None
+    db.session.commit()
+    _notify_status(br)
+    _log("deny", br.id, "Denied by admin")
+    flash("Request denied.", "info")
+    return redirect(url_for("admin_requests"))
+
+@app.post("/admin/requests/<int:req_id>/cancel")
+def cancel_request(req_id):
+    if not is_admin():
+        return redirect(url_for("admin_login"))
+    br = BookingRequest.query.get_or_404(req_id)
+    br.status = "cancelled"
+    if br.calendar_event_id:
+        remove_event_from_calendar(br.calendar_event_id)
+        br.calendar_event_id = None
+    db.session.commit()
+    _notify_status(br)
+    _log("cancel", br.id, "Cancelled by admin")
+    flash("Request cancelled and calendar updated.", "warning")
+    return redirect(url_for("admin_requests"))
+
+# Public read-only ICS feed
+@app.route("/calendar.ics")
+def calendar_ics():
+    events = (BookingRequest.query
+              .filter(BookingRequest.status == "approved")
+              .order_by(BookingRequest.start_date.asc())
+              .all())
+    def esc(s): return (s or "").replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
+    def fold(line, limit=75):
+        if len(line) <= limit: return [line]
+        out = []
+        while len(line) > limit:
+            out.append(line[:limit]); line = " " + line[limit:]
+        out.append(line); return out
+
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//LakeHouse//Bookings//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "X-WR-CALNAME:Lake House Bookings",
+    ]
+    for r in events:
+        uid = f"lakehouse-{r.id}@example.local"
+        dtstamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        dtstart = r.start_date.strftime("%Y%m%d")
+        dtend = (r.end_date + timedelta(days=1)).strftime("%Y%m%d")
+        summary = esc(f"Lake House: {r.member.name} ({r.member.member_type})")
+        desc = esc((r.notes or "") + f"\\nMember email: {r.member.email}")
+        ev = [
+            "BEGIN:VEVENT",
+            f"UID:{uid}",
+            f"DTSTAMP:{dtstamp}",
+            f"DTSTART;VALUE=DATE:{dtstart}",
+            f"DTEND;VALUE=DATE:{dtend}",
+            f"SUMMARY:{summary}",
+            f"DESCRIPTION:{desc}",
+            "END:VEVENT",
+        ]
+        for line in ev: lines.extend(fold(line))
+    ics = "\r\n".join(lines + ["END:VCALENDAR"]) + "\r\n"  # real CRLFs for iCal
+    return Response(ics, mimetype="text/calendar")
+
+# Diagnostics
+@app.route("/_diag")
+def _diag():
+    try:
+        return jsonify({
+            "cwd": os.getcwd(),
+            "python_version": sys.version,
+            "base_dir": str(BASE_DIR),
+            "template_dir": str(TEMPLATES_DIR),
+            "has_templates_dir": TEMPLATES_DIR.is_dir(),
+            "templates_list": sorted(p.name for p in TEMPLATES_DIR.glob("*")) if TEMPLATES_DIR.is_dir() else [],
+            "files_in_cwd": sorted(os.listdir(".")),
+        })
+    except Exception as e:
+        return {"error": repr(e)}, 500
+
+# Reminders (opt-in: set ENABLE_SCHEDULER=1)
+def send_upcoming_reminders():
+    today = date.today()
+    in_two_days = today + timedelta(days=2)
+    upcoming = BookingRequest.query.filter(
+        BookingRequest.status == "approved",
+        BookingRequest.start_date == in_two_days
+    ).all()
+    for br in upcoming:
+        send_email(
+            br.member.email,
+            "Lake House reminder",
+            f"Hi {br.member.name}, your lake house stay starts on {br.start_date}. Enjoy!"
+        )
+        if br.member.phone:
+            send_sms(br.member.phone, f"Reminder: your lake house stay starts on {br.start_date}.")
+
+if os.getenv("ENABLE_SCHEDULER", "0") == "1":
+    scheduler = BackgroundScheduler(daemon=True)
+    scheduler.add_job(send_upcoming_reminders, "cron", hour=9, minute=0)
+    scheduler.start()
+
+@app.cli.command("init-db")
+def init_db():
+    db.create_all()
+    print("Database initialized.")
+
+if __name__ == "__main__":
+    with app.app_context():
+        db.create_all()
+    app.run(host="0.0.0.0", port=5000)
