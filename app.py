@@ -299,6 +299,18 @@ def admin_logout():
     flash("Logged out.", "info")
     return redirect(url_for("home"))
 
+@app.route("/admin/_diag")
+def admin_diag():
+    # masks the email so it’s not fully exposed
+    raw = os.getenv("ADMIN_EMAIL", "")
+    masked = (raw[:2] + "***" + raw[-2:]) if len(raw) >= 5 else ("***" if raw else "")
+    return {
+        "has_secret_key": bool(app.config.get("SECRET_KEY")),
+        "has_admin_email": bool(os.getenv("ADMIN_EMAIL")),
+        "admin_email_masked": masked,
+        "has_admin_password": bool(os.getenv("ADMIN_PASSWORD")),
+    }, 200
+    
 @app.route("/admin/requests")
 def admin_requests():
     if not is_admin():
