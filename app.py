@@ -9,6 +9,8 @@ from wtforms import StringField, SelectField, DateField, TextAreaField, SubmitFi
 from wtforms.validators import DataRequired, Email, Length
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
+from jinja2 import TemplateNotFound
+from flask import render_template_string, flash
 
 # Notifications
 import smtplib
@@ -320,29 +322,42 @@ def admin_diag():
         "has_admin_password": bool(os.getenv("ADMIN_PASSWORD")),
     }, 200
     
-@app.route("/admin/requests")
-def admin_requests():
-    if not is_admin():
-        return redirect(url_for("admin_login"))
-    dues_first = case((Member.member_type == "due", 0), else_=1)
-    pending = (db.session.query(BookingRequest)
-               .join(Member)
-               .filter(BookingRequest.status=="pending")
-               .order_by(dues_first.asc(), BookingRequest.created_at.asc())
-               .all())
-    approved = (db.session.query(BookingRequest)
-                .join(Member)
-                .filter(BookingRequest.status=="approved")
-                .order_by(dues_first.asc(), BookingRequest.start_date.asc())
-                .all())
-    denied = (db.session.query(BookingRequest)
-              .join(Member)
-              .filter(BookingRequest.status=="denied")
-              .order_by(BookingRequest.created_at.desc())
-              .all())
-    logs = AuditLog.query.order_by(AuditLog.created_at.desc()).limit(50).all()
-    return render_template("admin_requests.html", pending=pending, approved=approved, denied=denied, logs=logs)
-
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    form = AdminLoginForm()
+    if request.method == "POST":
+        if not form.validate_on_submit():
+            flash(f"Form validation failed: {form.errors}", "danger")
+        else:
+            admin_email = os.getenv("ADMIN_EMAIL", "")
+            admin_password = os.getenv("ADMIN_PASSWORD", "")
+            ok_email = form.email.data.strip().lower() == admin_email.strip().lower()
+            ok_pwd   = form.password.data == admin_password
+            if ok_email and ok_pwd:
+                session["is_admin"] = True
+                flash("Welcome, admin!", "success")
+                return redirect(url_for("admin_requests"))
+            else:
+                flash("Invalid credentials.", "danger")
+    try:
+        return render_template("admin_login.html", form=form)
+    except TemplateNotFound:
+        app.logger.error("admin_login.html missing; rendering inline fallback")
+        return render_template_string("""
+        <!doctype html><html><head><meta charset="utf-8">
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+        <title>Admin Login (fallback)</title></head><body><main class="container">
+        <h2>Admin Login</h2>
+        <p style="color:#b91c1c">Template <code>templates/admin_login.html</code> not found; using fallback.</p>
+        <form method="POST">
+          {{ form.hidden_tag() }}
+          <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
+          <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
+          <button type="submit">Sign in</button>
+        </form>
+        </main></body></html>
+        """, form=form), 200
+        
 @app.post("/admin/requests/<int:req_id>/approve")
 def approve_request(req_id):
     if not is_admin():
@@ -394,6 +409,8 @@ def cancel_request(req_id):
     _log("cancel", br.id, "Cancelled by admin")
     flash("Request cancelled and calendar updated.", "warning")
     return redirect(url_for("admin_requests"))
+    
+
 
 # Public read-only ICS feed for approved bookings
 @app.route("/calendar.ics")
