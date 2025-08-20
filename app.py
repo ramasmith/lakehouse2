@@ -1,29 +1,31 @@
-# app.py — full booking app with calendar/email/SMS + resilient homepage
+# app.py — full booking app with calendar/email/SMS + resilient homepage (Render-safe)
 import os, sys
 from pathlib import Path
 from datetime import datetime, date, timedelta
-from flask import Flask, render_template, render_template_string, request, redirect, url_for, flash, session, Response, jsonify
+
+from flask import (
+    Flask, render_template, render_template_string, request,
+    redirect, url_for, flash, session, Response, jsonify
+)
+from jinja2 import TemplateNotFound
+
 from flask_sqlalchemy import SQLAlchemy
 from flask_wtf import FlaskForm
 from wtforms import StringField, SelectField, DateField, TextAreaField, SubmitField, BooleanField, PasswordField
 from wtforms.validators import DataRequired, Email, Length
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
-from jinja2 import TemplateNotFound
-from flask import render_template_string, flash
+from sqlalchemy import case
 
 # Notifications
 import smtplib
 from email.mime.text import MIMEText
 from twilio.rest import Client as TwilioClient
 
-# Google Calendar OAuth user credentials (desktop flow)
+# Google Calendar (uses token.json on server; skips OAuth flow)
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
-
-from sqlalchemy import case
 
 load_dotenv()
 
@@ -122,30 +124,28 @@ def send_sms(to_number, body):
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 def _get_google_creds():
-    """Use token.json if present; else attempt local OAuth (only works if Render secret files aren’t used)."""
-    creds = None
+    """
+    Server-safe creds: use token.json if present; refresh if needed.
+    Do NOT run OAuth browser flow on Render (no UI) — just skip if token missing.
+    To allow local OAuth, run on your machine to generate token.json, then upload to Render Secret Files.
+    """
     token_path = BASE_DIR / "token.json"
-    client_secret_path = BASE_DIR / "client_secret.json"
-    # On Render, these are provided as Secret Files mounted at the working dir (same as BASE_DIR)
     if token_path.exists():
         creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except Exception as e:
-                print(f"[Calendar] Refresh failed: {e}")
-                creds = None
-        if not creds:
-            if not client_secret_path.exists():
-                print("[Calendar] client_secret.json not found. Skipping calendar integration.")
-                return None
-            # NOTE: This OAuth flow opens a browser — works locally; on Render you should upload token.json from local.
-            flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_path), SCOPES)
-            creds = flow.run_local_server(port=0)
-            with open(token_path, "w") as token:
-                token.write(creds.to_json())
-    return creds
+        if not creds.valid:
+            if creds.refresh_token:
+                try:
+                    creds.refresh(Request())
+                    # persist refreshed token
+                    with open(token_path, "w") as f:
+                        f.write(creds.to_json())
+                except Exception as e:
+                    print(f"[Calendar] Refresh failed: {e}")
+                    return None
+        return creds
+    # No token.json on server — skip (don’t try browser flow)
+    print("[Calendar] token.json not found; skipping calendar sync on server.")
+    return None
 
 def add_event_to_calendar(summary, start_date, end_date, description=""):
     calendar_id = os.getenv("GOOGLE_CALENDAR_ID")
@@ -188,11 +188,7 @@ def find_conflicts(start_date, end_date, exclude_request_id=None):
     q = BookingRequest.query.filter(BookingRequest.status == "approved")
     if exclude_request_id:
         q = q.filter(BookingRequest.id != exclude_request_id)
-    conflicts = []
-    for r in q.all():
-        if ranges_overlap(start_date, end_date, r.start_date, r.end_date):
-            conflicts.append(r)
-    return conflicts
+    return [r for r in q.all() if ranges_overlap(start_date, end_date, r.start_date, r.end_date)]
 
 def is_admin():
     return bool(session.get("is_admin"))
@@ -217,21 +213,20 @@ def _notify_status(br: BookingRequest):
         send_sms(member.phone, f"Lake House: your request {br.status} for {br.start_date} - {br.end_date}.")
 
 # -----------------------------
-# Routes — resilient homepage
+# Ensure DB exists (Render-safe)
 # -----------------------------
-
 @app.before_request
 def _ensure_db():
-    # Only run once per process
     if not getattr(app, "_db_inited", False):
         with app.app_context():
             db.create_all()
         app._db_inited = True
 
-
+# -----------------------------
+# Routes
+# -----------------------------
 @app.route("/", methods=["GET", "POST"])
 def home():
-    # If template exists, render full booking form; else inline fallback so site always loads
     if (TEMPLATES_DIR / "home.html").exists():
         form = RequestForm()
         if form.validate_on_submit():
@@ -267,11 +262,15 @@ def home():
             send_email(
                 os.getenv("ADMIN_EMAIL", member.email),
                 "New Lake House Booking Request",
-                f"{member.name} ({member.member_type}) requested {br.start_date} - {br.end_date}.\nNotes: {br.notes or '(none)'}\nReview: {request.url_root}admin/requests"
+                f"{member.name} ({member.member_type}) requested {br.start_date} - {br.end_date}.\n"
+                f"Notes: {br.notes or '(none)'}\nReview: {request.url_root}admin/requests"
             )
+            # FIXED: was missing f-string before
             send_email(
                 member.email,
-                "We received your lake house request", "Hi {member.name},\n\nWe received your request for {br.start_date} to {br.end_date}. We'll notify you once it's approved or denied.\n\nThanks!"
+                "We received your lake house request",
+                f"Hi {member.name},\n\nWe received your request for {br.start_date} to {br.end_date}. "
+                "We'll notify you once it's approved or denied.\n\nThanks!"
             )
             if form.subscribe_sms.data and member.phone:
                 send_sms(member.phone, f"Lake House: request received for {br.start_date} - {br.end_date}.")
@@ -280,7 +279,8 @@ def home():
             flash("Request submitted! You'll receive an email confirmation.", "success")
             return redirect(url_for("home"))
         return render_template("home.html", form=form)
-    # fallback inline
+
+    # fallback inline if template missing
     return render_template_string("""
       <!doctype html><html lang="en"><head><meta charset="utf-8"><title>Lake House</title></head>
       <body>
@@ -293,49 +293,6 @@ def home():
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
     form = AdminLoginForm()
-    if form.validate_on_submit():
-        admin_email = os.getenv("ADMIN_EMAIL", "")
-        admin_password = os.getenv("ADMIN_PASSWORD", "")
-        if form.email.data.strip().lower() == admin_email.strip().lower() and form.password.data == admin_password:
-            session["is_admin"] = True
-            flash("Welcome, admin!", "success")
-            return redirect(url_for("admin_requests"))
-        else:
-            flash("Invalid credentials", "danger")
-    return render_template("admin_login.html", form=form)
-
-@app.route("/admin/logout")
-def admin_logout():
-    session.clear()
-    flash("Logged out.", "info")
-    return redirect(url_for("home"))
-
-@app.route("/admin/_diag")
-def admin_diag():
-    # masks the email so it’s not fully exposed
-    raw = os.getenv("ADMIN_EMAIL", "")
-    masked = (raw[:2] + "***" + raw[-2:]) if len(raw) >= 5 else ("***" if raw else "")
-    return {
-        "has_secret_key": bool(app.config.get("SECRET_KEY")),
-        "has_admin_email": bool(os.getenv("ADMIN_EMAIL")),
-        "admin_email_masked": masked,
-        "has_admin_password": bool(os.getenv("ADMIN_PASSWORD")),
-    }, 200
-
-@app.route("/_ls")
-def _ls():
-    import os
-    tree = []
-    for root, dirs, files in os.walk(".", topdown=True):
-        # keep output small
-        if "/.venv" in root or "/site-packages" in root:
-            continue
-        tree.append({"root": root, "dirs": sorted(dirs), "files": sorted(files)})
-    return {"cwd": os.getcwd(), "tree": tree}, 200
-    
-@app.route("/admin/login", methods=["GET", "POST"])
-def admin_login():
-    form = AdminLoginForm()
     if request.method == "POST":
         if not form.validate_on_submit():
             flash(f"Form validation failed: {form.errors}", "danger")
@@ -343,7 +300,7 @@ def admin_login():
             admin_email = os.getenv("ADMIN_EMAIL", "")
             admin_password = os.getenv("ADMIN_PASSWORD", "")
             ok_email = form.email.data.strip().lower() == admin_email.strip().lower()
-            ok_pwd   = form.password.data == admin_password
+            ok_pwd = form.password.data == admin_password
             if ok_email and ok_pwd:
                 session["is_admin"] = True
                 flash("Welcome, admin!", "success")
@@ -355,20 +312,73 @@ def admin_login():
     except TemplateNotFound:
         app.logger.error("admin_login.html missing; rendering inline fallback")
         return render_template_string("""
-        <!doctype html><html><head><meta charset="utf-8">
-        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
-        <title>Admin Login (fallback)</title></head><body><main class="container">
-        <h2>Admin Login</h2>
-        <p style="color:#b91c1c">Template <code>templates/admin_login.html</code> not found; using fallback.</p>
-        <form method="POST">
-          {{ form.hidden_tag() }}
-          <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
-          <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
-          <button type="submit">Sign in</button>
-        </form>
-        </main></body></html>
+          <!doctype html><html><head><meta charset="utf-8">
+          <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+          <title>Admin Login (fallback)</title></head><body><main class="container">
+          <h2>Admin Login</h2>
+          <p style="color:#b91c1c">Template <code>templates/admin_login.html</code> not found; using fallback.</p>
+          <form method="POST">
+            {{ form.hidden_tag() }}
+            <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
+            <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
+            <button type="submit">Sign in</button>
+          </form>
+          </main></body></html>
         """, form=form), 200
-        
+
+@app.route("/admin/logout")
+def admin_logout():
+    session.clear()
+    flash("Logged out.", "info")
+    return redirect(url_for("home"))
+
+@app.route("/admin/requests")
+def admin_requests():
+    if not is_admin():
+        return redirect(url_for("admin_login"))
+    dues_first = case((Member.member_type == "due", 0), else_=1)
+    pending = (db.session.query(BookingRequest)
+               .join(Member)
+               .filter(BookingRequest.status == "pending")
+               .order_by(dues_first.asc(), BookingRequest.created_at.asc())
+               .all())
+    approved = (db.session.query(BookingRequest)
+                .join(Member)
+                .filter(BookingRequest.status == "approved")
+                .order_by(dues_first.asc(), BookingRequest.start_date.asc())
+                .all())
+    denied = (db.session.query(BookingRequest)
+              .join(Member)
+              .filter(BookingRequest.status == "denied")
+              .order_by(BookingRequest.created_at.desc())
+              .all())
+    return render_template("admin_requests.html",
+                           pending=pending, approved=approved, denied=denied,
+                           logs=AuditLog.query.order_by(AuditLog.created_at.desc()).limit(50).all())
+
+# Admin diag
+@app.route("/admin/_diag")
+def admin_diag():
+    raw = os.getenv("ADMIN_EMAIL", "")
+    masked = (raw[:2] + "***" + raw[-2:]) if len(raw) >= 5 else ("***" if raw else "")
+    return {
+        "has_secret_key": bool(app.config.get("SECRET_KEY")),
+        "has_admin_email": bool(os.getenv("ADMIN_EMAIL")),
+        "admin_email_masked": masked,
+        "has_admin_password": bool(os.getenv("ADMIN_PASSWORD")),
+    }, 200
+
+# Files diag
+@app.route("/_ls")
+def _ls():
+    tree = []
+    for root, dirs, files in os.walk(".", topdown=True):
+        if "/.venv" in root or "/site-packages" in root:
+            continue
+        tree.append({"root": root, "dirs": sorted(dirs), "files": sorted(files)})
+    return {"cwd": os.getcwd(), "tree": tree}, 200
+
+# Actions
 @app.post("/admin/requests/<int:req_id>/approve")
 def approve_request(req_id):
     if not is_admin():
@@ -420,13 +430,14 @@ def cancel_request(req_id):
     _log("cancel", br.id, "Cancelled by admin")
     flash("Request cancelled and calendar updated.", "warning")
     return redirect(url_for("admin_requests"))
-    
 
-
-# Public read-only ICS feed for approved bookings
+# Public read-only ICS feed
 @app.route("/calendar.ics")
 def calendar_ics():
-    events = BookingRequest.query.filter(BookingRequest.status=="approved").order_by(BookingRequest.start_date.asc()).all()
+    events = (BookingRequest.query
+              .filter(BookingRequest.status == "approved")
+              .order_by(BookingRequest.start_date.asc())
+              .all())
     def esc(s): return (s or "").replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
     def fold(line, limit=75):
         if len(line) <= limit: return [line]
@@ -480,7 +491,7 @@ def _diag():
     except Exception as e:
         return {"error": repr(e)}, 500
 
-# Reminders (daily at 09:00)
+# Reminders (opt-in: set ENABLE_SCHEDULER=1)
 def send_upcoming_reminders():
     today = date.today()
     in_two_days = today + timedelta(days=2)
@@ -497,9 +508,10 @@ def send_upcoming_reminders():
         if br.member.phone:
             send_sms(br.member.phone, f"Reminder: your lake house stay starts on {br.start_date}.")
 
-scheduler = BackgroundScheduler(daemon=True)
-scheduler.add_job(send_upcoming_reminders, "cron", hour=9, minute=0)
-scheduler.start()
+if os.getenv("ENABLE_SCHEDULER", "0") == "1":
+    scheduler = BackgroundScheduler(daemon=True)
+    scheduler.add_job(send_upcoming_reminders, "cron", hour=9, minute=0)
+    scheduler.start()
 
 @app.cli.command("init-db")
 def init_db():
@@ -510,3 +522,4 @@ if __name__ == "__main__":
     with app.app_context():
         db.create_all()
     app.run(host="0.0.0.0", port=5000)
+
