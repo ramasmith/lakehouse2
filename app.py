@@ -20,7 +20,7 @@ from sqlalchemy import case
 
 # Notifications
 import smtplib
-from email.mime_text import MIMEText  # type: ignore  # Some environments warn; it's correct.
+#from email.mime_text import MIMEText  # type: ignore  # Some environments warn; it's correct.
 from email.mime.text import MIMEText
 from twilio.rest import Client as TwilioClient
 
