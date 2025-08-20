@@ -24,7 +24,7 @@
         {% if session.get('is_admin') %}
           <li><a href="{{ url_for('admin_logout') }}">Logout</a></li>
         {% else %}
-          <li><a href="{{ url_for('admin_login') }}">Admin Login</a></li>
+          <li><a href="{{ url_for('admin_login') }}">Admin</a></li>
         {% endif %}
       </ul>
     </nav>
