@@ -14,7 +14,7 @@
   </thead>
   <tbody>
   {% for r in pending %}
-    {% set gcs = gcal_conf.get(r.id, []) %}
+    {% set conflicts = (gcal_conf.get(r.id) or []) %}
     <tr>
       <td>
         {{ r.member.name }} ({{ r.member.member_type }})<br>
@@ -23,23 +23,20 @@
       <td>{{ r.start_date }} → {{ r.end_date }}</td>
       <td>{{ r.notes }}</td>
       <td>
-        {% if gcs and gcs|length > 0 %}
-          <span class="badge warn" title="{{ gcs|join('; ') }}">GCal conflict</span>
-          <details style="margin-top:0.25rem;">
-            <summary>details</summary>
-            <ul style="margin:0.25rem 0 0 1rem;">
-              {% for c in gcs %}
-                <li>{{ c }}</li>
-              {% endfor %}
-            </ul>
-          </details>
+        {% if conflicts|length > 0 %}
+          <span class="tag" style="background:#fee2e2; color:#991b1b;"
+                title="{{ conflicts|join('; ') }}">
+            ⚠︎ {{ conflicts|length }} conflict{{ 's' if conflicts|length > 1 }}
+          </span>
         {% else %}
-          —
+          <span class="tag">Clear</span>
         {% endif %}
       </td>
       <td>
         <form method="POST" action="{{ url_for('approve_request', req_id=r.id) }}" style="display:inline;">
-          <button>Approve</button>
+          <button{% if conflicts|length > 0 %} class="secondary" title="Resolve calendar conflicts before approving"{% endif %}>
+            Approve
+          </button>
         </form>
         <form method="POST" action="{{ url_for('deny_request', req_id=r.id) }}" style="display:inline;">
           <button class="secondary">Deny</button>
