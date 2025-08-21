@@ -1,5 +1,7 @@
 # app.py — Lake House bookings (Render-safe, single-file, self-healing templates)
 import os, sys
+import socket 
+
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from urllib.parse import quote
