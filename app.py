@@ -826,6 +826,9 @@ def admin_requests():
         .all()
     )
 
+    # NEW: map of request_id -> list of GCal conflict strings
+    gcal_conf = {r.id: find_calendar_conflicts(r.start_date, r.end_date) for r in pending}
+
     approved = (
         db.session.query(BookingRequest)
         .join(Member)
@@ -847,8 +850,10 @@ def admin_requests():
         pending=pending,
         approved=approved,
         denied=denied,
+        gcal_conf=gcal_conf,  # <-- pass to template
         logs=AuditLog.query.order_by(AuditLog.created_at.desc()).limit(50).all(),
     )
+
 
 # Actions
 # --- replace your existing approve_request with this exact version ---
