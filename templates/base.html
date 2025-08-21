@@ -28,12 +28,12 @@
       <ul><li><strong>Lake House Bookings</strong></li></ul>
       <ul>
         <li><a href="{{ url_for('home') }}">Request</a></li>
-        <li><a href="{{ url_for('admin_requests') }}">Admin</a></li>
+        <li><a href="{{ url_for('admin_requests') }}">Admin View</a></li>
         <li><a href="{{ url_for('calendar_ics') }}">ICS feed</a></li>
         {% if session.get('is_admin') %}
           <li><a href="{{ url_for('admin_logout') }}">Logout</a></li>
         {% else %}
-          <li><a href="{{ url_for('admin_login') }}">Admin</a></li>
+          <li><a href="{{ url_for('admin_login') }}">Admin Login</a></li>
         {% endif %}
         <li><a href="{{ url_for('calendar_view') }}">Calendar</a></li>
       </ul>
