@@ -6,6 +6,7 @@ from io import StringIO
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from urllib.parse import quote
+from werkzeug.security import generate_password_hash, check_password_hash
 
 from flask import (
     Flask, render_template, render_template_string, request,
@@ -66,6 +67,14 @@ class Member(db.Model):
     # Accounts
     password_hash = db.Column(db.String(255), nullable=True)
     is_active = db.Column(db.Boolean, default=True, nullable=False)
+    #password_hash = db.Column(db.String(255), nullable=True)  # new
+
+def set_password(self, password: str):
+    self.password_hash = generate_password_hash(password)
+
+def check_password(self, password: str) -> bool:
+    return bool(self.password_hash) and check_password_hash(self.password_hash, password)
+
 
 class BookingRequest(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -138,6 +147,19 @@ class AdminLoginForm(FlaskForm):
     password = PasswordField("Password", validators=[DataRequired()])
     submit = SubmitField("Sign in")
 
+class MemberRegisterForm(FlaskForm):
+    name = StringField("Full name", validators=[DataRequired(), Length(max=120)])
+    email = StringField("Email", validators=[DataRequired(), Email()])
+    phone = StringField("Phone (optional)")
+    member_type = SelectField("Membership Type", choices=[("due","Due-paying member"),("non_due","Non due-paying member")], validators=[DataRequired()])
+    password = PasswordField("Password", validators=[DataRequired(), Length(min=6, max=128)])
+    submit = SubmitField("Create account")
+
+class MemberLoginForm(FlaskForm):
+    email = StringField("Email", validators=[DataRequired(), Email()])
+    password = PasswordField("Password", validators=[DataRequired()])
+    submit = SubmitField("Sign in")
+
 class SignupForm(FlaskForm):
     name = StringField("Full name", validators=[DataRequired(), Length(max=120)])
     email = StringField("Email", validators=[DataRequired(), Email()])
@@ -149,6 +171,7 @@ class SigninForm(FlaskForm):
     email = StringField("Email", validators=[DataRequired(), Email()])
     password = PasswordField("Password", validators=[DataRequired()])
     submit = SubmitField("Sign in")
+    
 
 # --- SELF-HEALING TEMPLATES ---
 DEFAULT_TEMPLATES = {
@@ -797,6 +820,67 @@ def signup():
         flash("Account created. Welcome!", "success")
         return redirect(url_for("my_requests"))
     return render_template("auth_signup.html", form=form)
+@app.route("/account/register", methods=["GET", "POST"])
+def account_register():
+    if session.get("member_id"):
+        return redirect(url_for("account_requests"))
+    form = MemberRegisterForm()
+    if form.validate_on_submit():
+        email = form.email.data.strip().lower()
+        existing = Member.query.filter(db.func.lower(Member.email) == email).first()
+        if existing:
+            flash("An account with that email already exists. Try signing in.", "warning")
+            return redirect(url_for("account_login"))
+
+        m = Member(
+            name=form.name.data.strip(),
+            email=email,
+            phone=form.phone.data.strip() if form.phone.data else None,
+            member_type=form.member_type.data,
+        )
+        m.set_password(form.password.data)
+        db.session.add(m)
+        db.session.commit()
+        session["member_id"] = m.id
+        flash("Welcome! Your account was created.", "success")
+        return redirect(url_for("account_requests"))
+    # render (self-healing template added below)
+    return render_template("member_register.html", form=form)
+
+@app.route("/account/login", methods=["GET", "POST"])
+def account_login():
+    if session.get("member_id"):
+        return redirect(url_for("account_requests"))
+    form = MemberLoginForm()
+    if form.validate_on_submit():
+        email = form.email.data.strip().lower()
+        m = Member.query.filter(db.func.lower(Member.email) == email).first()
+        if not m or not m.check_password(form.password.data):
+            flash("Invalid email or password.", "danger")
+        else:
+            session["member_id"] = m.id
+            flash("Signed in.", "success")
+            return redirect(url_for("account_requests"))
+    return render_template("member_login.html", form=form)
+
+@app.route("/account/logout")
+def account_logout():
+    session.pop("member_id", None)
+    flash("Signed out.", "info")
+    return redirect(url_for("home"))
+
+@app.route("/account/requests")
+def account_requests():
+    if not session.get("member_id"):
+        flash("Please sign in to view your requests.", "warning")
+        return redirect(url_for("account_login"))
+    me = Member.query.get_or_404(session["member_id"])
+    my_reqs = (BookingRequest.query
+               .filter(BookingRequest.member_id == me.id)
+               .order_by(BookingRequest.created_at.desc())
+               .all())
+    return render_template("member_requests.html", me=me, requests=my_reqs)
+
 
 @app.route("/signin", methods=["GET", "POST"])
 def signin():
