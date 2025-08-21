@@ -1002,13 +1002,6 @@ def admin_requests():
         .all()
     )
 
-    # Build Google Calendar conflict flags for pending (non-blocking)
-    pending_conflicts = {}
-    for r in pending:
-        gcs = find_calendar_conflicts(r.start_date, r.end_date)
-        if gcs:
-            pending_conflicts[r.id] = gcs
-
     approved = (
         db.session.query(BookingRequest)
         .join(Member)
@@ -1025,14 +1018,29 @@ def admin_requests():
         .all()
     )
 
+    # NEW: Build a dict of {booking_request_id: [conflict strings]} for pending items
+    gcal_conf = {}
+    try:
+        if GOOGLE_OK and os.getenv("GOOGLE_CALENDAR_ID"):
+            for r in pending:
+                try:
+                    gcal_conf[r.id] = find_calendar_conflicts(r.start_date, r.end_date)
+                except Exception as e:
+                    app.logger.warning(f"[gcal_conf] failed for req {r.id}: {e}")
+        else:
+            app.logger.info("[gcal_conf] skipped (no google libs or GOOGLE_CALENDAR_ID)")
+    except Exception as e:
+        app.logger.warning(f"[gcal_conf] top-level failure: {e}")
+
     return render_template(
         "admin_requests.html",
         pending=pending,
         approved=approved,
         denied=denied,
-        pending_conflicts=pending_conflicts,
         logs=AuditLog.query.order_by(AuditLog.created_at.desc()).limit(50).all(),
+        gcal_conf=gcal_conf,  # <-- pass to template
     )
+
 
 # Actions
 @app.post("/admin/requests/<int:req_id>/approve")
