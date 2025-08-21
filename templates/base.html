@@ -1,70 +1,61 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Lake House Bookings</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css" />
   <style>
     .badge { padding: 0.2rem 0.4rem; border-radius: 4px; font-size: 0.75rem; }
-    .badge.due { background: #0ea5e9; color: white; }
-    .badge.non_due { background: #94a3b8; color: white; }
-    .badge.warn { background: #f59e0b; color: #111; } /* NEW */
+    .badge.due { background: #0ea5e9; color: #fff; }
+    .badge.non_due { background: #94a3b8; color: #fff; }
     .tag { font-size: 0.75rem; padding: 0.15rem 0.35rem; border-radius: 999px; background: #e2e8f0; color:#334155; }
     code { font-size: 0.8rem; }
+    nav ul { align-items: center; }
   </style>
-  <style>
-  .badge { padding: 0.2rem 0.4rem; border-radius: 4px; font-size: 0.75rem; }
-  .badge.due { background: #0ea5e9; color: white; }
-  .badge.non_due { background: #94a3b8; color: white; }
-  .badge.warn { background: #f59e0b; color: #111; }  <!-- add this -->
-  .tag { font-size: 0.75rem; padding: 0.15rem 0.35rem; border-radius: 999px; background: #e2e8f0; color:#334155; }
-  code { font-size: 0.8rem; }
-</style>
 </head>
 <body>
   <main class="container">
     <nav>
-      <ul><li><strong>Lake House Bookings</strong></li></ul>
       <ul>
-  <li><a href="{{ url_for('home') }}">Request</a></li>
-  <li><a href="{{ url_for('calendar_view') }}">Calendar</a></li>
-  <li><a href="{{ url_for('calendar_ics') }}">ICS feed</a></li>
+        <li><strong><a href="{{ url_for('dashboard') }}" style="text-decoration:none;color:inherit;">Lake House Bookings</a></strong></li>
+      </ul>
+      <ul>
+        <li><a href="{{ url_for('dashboard') }}">Dashboard</a></li>
+        <li><a href="{{ url_for('request_booking') }}">Request Booking</a></li>
+        <li><a href="{{ url_for('calendar_view') }}">Calendar</a></li>
+        <li><a href="{{ url_for('calendar_ics') }}">ICS feed</a></li>
 
-  {# Member section #}
-  {% if session.get('member_id') %}
-    <li><a href="{{ url_for('account_requests') }}">My requests</a></li>
-    <li><a href="{{ url_for('account_logout') }}">Sign out</a></li>
-  {% else %}
-    <li><a href="{{ url_for('account_login') }}">Sign in</a></li>
-    <li><a href="{{ url_for('account_register') }}">Register</a></li>
-  {% endif %}
+        {% if session.get('user_member_id') %}
+          <li><a href="{{ url_for('signout') }}">Sign out</a></li>
+        {% else %}
+          <li><a href="{{ url_for('signin') }}">Sign in</a></li>
+          <li><a href="{{ url_for('signup') }}">Create account</a></li>
+        {% endif %}
 
-  {# Admin section #}
-  {% if session.get('is_admin') %}
-    <li><a href="{{ url_for('admin_requests') }}">Admin</a></li>
-    <li><a href="{{ url_for('admin_logout') }}">Admin logout</a></li>
-  {% else %}
-    <li><a href="{{ url_for('admin_login') }}">Admin</a></li>
-  {% endif %}
-</ul>
-
+        {% if session.get('is_admin') %}
+          <li><a href="{{ url_for('admin_requests') }}">Admin</a></li>
+          <li><a href="{{ url_for('admin_logout') }}">Admin logout</a></li>
+        {% else %}
+          <li><a href="{{ url_for('admin_login') }}">Admin</a></li>
+        {% endif %}
+      </ul>
     </nav>
 
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% if messages %}
-        <div>
+        <section>
           {% for category, message in messages %}
             <article class="{{ category }}">{{ message }}</article>
           {% endfor %}
-        </div>
+        </section>
       {% endif %}
     {% endwith %}
 
     {% block content %}{% endblock %}
 
     <footer style="margin-top:3rem; font-size:0.9rem; color:#64748b;">
-      Built with Flask • Conflict detection • Dues priority • Audit log • ICS feed
+      Built with Flask • Dashboard • Conflict detection • Dues priority • Audit log • ICS feed • Accounts
     </footer>
   </main>
 </body>
