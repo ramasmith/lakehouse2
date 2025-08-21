@@ -26,6 +26,9 @@
             <span class="tag">None</span>
           {% endif %}
         </td>
+            {% if gcs and gcs|length > 0 %}
+          <span class="badge warn" title="{{ gcs|join('; ') }}">GCal conflict</span>
+          <details style="margin-top:0.25rem;">
         <td>
           <form method="POST" action="{{ url_for('approve_request', req_id=r.id) }}" style="display:inline;">
             <button>Approve</button>
