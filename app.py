@@ -489,6 +489,109 @@ def remove_event_from_calendar(event_id):
         print(f"[Calendar] Failed to delete event: {e}")
         return False
 
+# --- Google Calendar conflict checks ---------------------------------
+def _parse_gcal_date_or_datetime(when):
+    """
+    Accepts a Google Calendar 'start'/'end' dict which may contain either:
+      - {'date': 'YYYY-MM-DD'}  (all-day, RFC 3339 date, end is exclusive)
+      - {'dateTime': 'YYYY-MM-DDTHH:MM:SSZ' or with offset}
+    Returns (start_date_inclusive, end_date_exclusive) as date objects.
+    """
+    # All-day events
+    if "date" in when:
+        d = datetime.fromisoformat(when["date"])
+        return d.date(), d.date()  # caller will add +1 for exclusive logic
+
+    # Timed events
+    dt_raw = when.get("dateTime")
+    if not dt_raw:
+        # Fallback: treat as zero-length today (shouldn't happen)
+        today = date.today()
+        return today, today
+
+    # Normalize 'Z' to '+00:00' so fromisoformat can parse
+    if dt_raw.endswith("Z"):
+        dt_raw = dt_raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(dt_raw)
+    except Exception:
+        # Last resort: strip timezone and parse naive
+        dt = datetime.fromisoformat(dt_raw.split("+")[0].split("-")[0])
+    return dt.date(), dt.date()
+
+def _gcal_list_events_between(start_date: date, end_date: date):
+    """
+    Query Google Calendar for events intersecting [start_date, end_date] (inclusive).
+    Returns a list of raw event dicts. DRY-RUN returns [] when GCal isn’t configured.
+    """
+    calendar_id = os.getenv("GOOGLE_CALENDAR_ID")
+    if not (calendar_id and GOOGLE_OK):
+        print("[Calendar] Conflict check skipped (no GOOGLE_CALENDAR_ID or google libs).")
+        return []
+
+    creds = _get_google_creds()
+    if not creds:
+        print("[Calendar] Conflict check skipped (no token.json/creds).")
+        return []
+
+    # timeMin inclusive; timeMax exclusive -> add 1 day at midnight
+    time_min = datetime.combine(start_date, datetime.min.time()).isoformat() + "Z"
+    time_max = datetime.combine(end_date + timedelta(days=1), datetime.min.time()).isoformat() + "Z"
+
+    try:
+        service = build("calendar", "v3", credentials=creds)
+        events = service.events().list(
+            calendarId=calendar_id,
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime",
+        ).execute().get("items", [])
+        return events
+    except Exception as e:
+        print(f"[Calendar] Conflict list failed: {e!r}")
+        return []
+
+def find_calendar_conflicts(start_date: date, end_date: date):
+    """
+    Returns a list of *human-readable* conflict strings from Google Calendar
+    that overlap the requested inclusive date range.
+    """
+    items = _gcal_list_events_between(start_date, end_date)
+    conflicts = []
+
+    for ev in items:
+        s_raw = ev.get("start", {})
+        e_raw = ev.get("end", {})
+
+        s_date, _ = _parse_gcal_date_or_datetime(s_raw)
+        e_date, _ = _parse_gcal_date_or_datetime(e_raw)
+
+        # Google all-day 'end' is exclusive; for timed events we treat end date as inclusive day
+        if "date" in e_raw:
+            g_start = s_date
+            g_end_exclusive = datetime.fromisoformat(e_raw["date"]).date()
+        else:
+            # For timed events, consider the end date inclusive for overlap purposes by adding +1
+            g_start = s_date
+            g_end_exclusive = e_date + timedelta(days=1)
+
+        # Our requested window in exclusive form:
+        req_start = start_date
+        req_end_exclusive = end_date + timedelta(days=1)
+
+        overlaps = not (req_end_exclusive <= g_start or g_end_exclusive <= req_start)
+        if overlaps:
+            title = ev.get("summary") or "(untitled)"
+            # Display span as inclusive dates for humans
+            disp_start = g_start.isoformat()
+            disp_end = (g_end_exclusive - timedelta(days=1)).isoformat()
+            conflicts.append(f"{title} [{disp_start} → {disp_end}]")
+
+    return conflicts
+# ---------------------------------------------------------------------
+
+
 # -----------------------------
 # Business rules & admin helpers
 # -----------------------------
@@ -658,6 +761,17 @@ def calendar_view():
             "&showPrint=0&showTitle=0"
         )
     return render_template("calendar_embed.html", embed_src=embed_src, calendar_id=cal_id)
+    
+# existing:
+conflicts = find_conflicts(br.start_date, br.end_date)
+if conflicts:
+    flash("Heads up: those dates overlap with an approved booking. Admin will review.", "warning")
+
+# NEW: Google Calendar conflict warning (non-blocking at request time)
+gc_conflicts = find_calendar_conflicts(br.start_date, br.end_date)
+if gc_conflicts:
+    flash("Google Calendar shows overlapping events: " + "; ".join(gc_conflicts), "warning")
+
 
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
@@ -752,6 +866,12 @@ def approve_request(req_id):
         conflict_list = ", ".join([f"{c.member.name}({c.start_date}→{c.end_date})" for c in conflicts])
         flash(f"Cannot approve: date conflict with {conflict_list}.", "danger")
         return redirect(url_for("admin_requests"))
+    # NEW: Google Calendar conflict block
+gc_conflicts = find_calendar_conflicts(br.start_date, br.end_date)
+if gc_conflicts:
+    flash("Cannot approve: Google Calendar already has overlapping event(s): " + "; ".join(gc_conflicts), "danger")
+    return redirect(url_for("admin_requests"))
+
     br.status = "approved"
     summary = f"Lake House: {br.member.name} ({br.member.member_type})"
     description = (br.notes or "") + f"\nMember email: {br.member.email}"
