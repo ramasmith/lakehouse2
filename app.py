@@ -826,9 +826,6 @@ def admin_requests():
         .all()
     )
 
-    # NEW: map of request_id -> list of GCal conflict strings
-    gcal_conf = {r.id: find_calendar_conflicts(r.start_date, r.end_date) for r in pending}
-
     approved = (
         db.session.query(BookingRequest)
         .join(Member)
@@ -844,6 +841,14 @@ def admin_requests():
         .order_by(BookingRequest.created_at.desc())
         .all()
     )
+
+    # Build a dict: booking_request_id -> list of human-readable conflicts from Google Calendar
+    # (find_calendar_conflicts() is already no-op if GCal isn't configured)
+    try:
+        gcal_conf = {r.id: find_calendar_conflicts(r.start_date, r.end_date) for r in pending}
+    except Exception as e:
+        app.logger.warning(f"[GCal conflicts] failed: {e!r}")
+        gcal_conf = {r.id: [] for r in pending}
 
     return render_template(
         "admin_requests.html",
