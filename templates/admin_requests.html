@@ -14,7 +14,10 @@
   </thead>
   <tbody>
   {% for r in pending %}
-    {% set conflicts = (gcal_conf.get(r.id) or []) %}
+   {% set conflicts = (gcal_conf|default({})).get(r.id, []) %}
+{% if conflicts %}
+  <span class="tag" title="{{ conflicts|join('; ') }}">GCal conflict</span>
+{% endif %}
     <tr>
       <td>
         {{ r.member.name }} ({{ r.member.member_type }})<br>
