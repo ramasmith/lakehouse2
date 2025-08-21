@@ -2,112 +2,94 @@
 {% block content %}
 <h2>Pending Requests</h2>
 {% if pending %}
-  <table role="grid">
-    <thead>
-      <tr><th>Member</th><th>Dates</th><th>Notes</th><th>Conflicts?</th> <th>GCal</th> <th>Actions</th></tr>
-    </thead>
-    <tbody>
-      {% for r in pending %}
-      {% set conflicts = [] %}
-      {% for a in approved %}
-        {% if not (r.end_date < a.start_date or a.end_date < r.start_date) %}
-          {% set _ = conflicts.append(a) %}
-        {% endif %}
-      {% endfor %}
-      <tr>
-        <td>{{ r.member.name }} <span class="badge {{ r.member.member_type }}">{{ r.member.member_type }}</span><br>
-            <small>{{ r.member.email }}{% if r.member.phone %} • {{ r.member.phone }}{% endif %}</small></td>
-        <td>{{ r.start_date }} → {{ r.end_date }}</td>
-        <td style="max-width: 360px;">{{ r.notes }}</td>
-        <td>
-          {% if conflicts %}
-            <span class="tag">⚠ {{ conflicts|length }} conflict(s)</span>
-          {% else %}
-            <span class="tag">None</span>
-          {% endif %}
-        </td>
-            {% if gcs and gcs|length > 0 %}
+<table role="grid">
+  <thead>
+    <tr>
+      <th>Member</th>
+      <th>Dates</th>
+      <th>Notes</th>
+      <th>GCal</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for r in pending %}
+    {% set gcs = gcal_conf.get(r.id, []) %}
+    <tr>
+      <td>
+        {{ r.member.name }} ({{ r.member.member_type }})<br>
+        <small>{{ r.member.email }}</small>
+      </td>
+      <td>{{ r.start_date }} → {{ r.end_date }}</td>
+      <td>{{ r.notes }}</td>
+      <td>
+        {% if gcs and gcs|length > 0 %}
           <span class="badge warn" title="{{ gcs|join('; ') }}">GCal conflict</span>
           <details style="margin-top:0.25rem;">
-        <td>
-          <form method="POST" action="{{ url_for('approve_request', req_id=r.id) }}" style="display:inline;">
-            <button>Approve</button>
-          </form>
-          <form method="POST" action="{{ url_for('deny_request', req_id=r.id) }}" style="display:inline;">
-            <button class="secondary">Deny</button>
-          </form>
-        </td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+            <summary>details</summary>
+            <ul style="margin:0.25rem 0 0 1rem;">
+              {% for c in gcs %}
+                <li>{{ c }}</li>
+              {% endfor %}
+            </ul>
+          </details>
+        {% else %}
+          —
+        {% endif %}
+      </td>
+      <td>
+        <form method="POST" action="{{ url_for('approve_request', req_id=r.id) }}" style="display:inline;">
+          <button>Approve</button>
+        </form>
+        <form method="POST" action="{{ url_for('deny_request', req_id=r.id) }}" style="display:inline;">
+          <button class="secondary">Deny</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
 {% else %}
-  <p>No pending requests.</p>
+<p>No pending requests.</p>
 {% endif %}
 
 <h2>Approved</h2>
 {% if approved %}
-  <table role="grid">
-    <thead>
-      <tr><th>Member</th><th>Dates</th><th>Calendar</th><th>Actions</th></tr>
-    </thead>
-    <tbody>
-      {% for r in approved %}
-      <tr>
-        <td>{{ r.member.name }} <span class="badge {{ r.member.member_type }}">{{ r.member.member_type }}</span></td>
-        <td>{{ r.start_date }} → {{ r.end_date }}</td>
-        <td>{% if r.calendar_event_id %}<code>{{ r.calendar_event_id }}</code>{% else %}-{% endif %}</td>
-        <td>
-          <form method="POST" action="{{ url_for('deny_request', req_id=r.id) }}" style="display:inline;">
-            <button class="secondary">Revoke</button>
-          </form>
-          <form method="POST" action="{{ url_for('cancel_request', req_id=r.id) }}" style="display:inline;">
-            <button class="contrast">Cancel</button>
-          </form>
-        </td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+<table role="grid">
+  <thead><tr><th>Member</th><th>Dates</th><th>Calendar</th><th>Actions</th></tr></thead>
+  <tbody>
+  {% for r in approved %}
+    <tr>
+      <td>{{ r.member.name }} ({{ r.member.member_type }})</td>
+      <td>{{ r.start_date }} → {{ r.end_date }}</td>
+      <td>{% if r.calendar_event_id %}<code>{{ r.calendar_event_id }}</code>{% else %}-{% endif %}</td>
+      <td>
+        <form method="POST" action="{{ url_for('deny_request', req_id=r.id) }}" style="display:inline;">
+          <button class="secondary">Revoke</button>
+        </form>
+        <form method="POST" action="{{ url_for('cancel_request', req_id=r.id) }}" style="display:inline;">
+          <button class="contrast">Cancel</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
 {% else %}
-  <p>No approved bookings.</p>
+<p>No approved bookings.</p>
 {% endif %}
 
 <h2>Denied</h2>
 {% if denied %}
-  <table role="grid">
-    <thead><tr><th>Member</th><th>Dates</th><th>Notes</th></tr></thead>
-    <tbody>
-      {% for r in denied %}
-      <tr>
-        <td>{{ r.member.name }} <span class="badge {{ r.member.member_type }}">{{ r.member.member_type }}</span></td>
-        <td>{{ r.start_date }} → {{ r.end_date }}</td>
-        <td>{{ r.notes }}</td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+<table role="grid">
+  <thead><tr><th>Member</th><th>Dates</th><th>Notes</th></tr></thead>
+  <tbody>
+  {% for r in denied %}
+    <tr><td>{{ r.member.name }}</td><td>{{ r.start_date }} → {{ r.end_date }}</td><td>{{ r.notes }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
 {% else %}
-  <p>No denied requests.</p>
-{% endif %}
-
-<h2>Recent Activity</h2>
-{% if logs %}
-  <table role="grid">
-    <thead><tr><th>When</th><th>Action</th><th>Request</th><th>Admin</th><th>Details</th></tr></thead>
-    <tbody>
-      {% for l in logs %}
-      <tr>
-        <td>{{ l.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
-        <td>{{ l.action }}</td>
-        <td>{{ l.request_id or "-" }}</td>
-        <td>{{ l.admin_email or "-" }}</td>
-        <td style="max-width: 480px;">{{ l.details }}</td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-{% else %}
-  <p>No recent activity.</p>
+<p>No denied requests.</p>
 {% endif %}
 {% endblock %}
