@@ -803,6 +803,26 @@ def not_found(e):
     """
     return make_response(html, 404)
 
+@app.route("/admin/_emailtest")
+def _emailtest():
+    if not is_admin():
+        return redirect(url_for("admin_login"))
+    to = request.args.get("to") or os.getenv("ADMIN_EMAIL")
+    if not to:
+        return jsonify({"ok": False, "error": "Provide ?to=someone@example.com or set ADMIN_EMAIL"}), 400
+    ok = send_email(to, "Lakehouse test email", "This is a test email from the Lakehouse app.")
+    return jsonify({"ok": ok})
+
+@app.route("/admin/_smstest")
+def _smstest():
+    if not is_admin():
+        return redirect(url_for("admin_login"))
+    to = request.args.get("to")  # Must be E.164 like +15551234567
+    if not to:
+        return jsonify({"ok": False, "error": "Provide ?to=+1XXXXXXXXXX"}), 400
+    ok = send_sms(to, "Lakehouse test SMS: hello from the app.")
+    return jsonify({"ok": ok})
+
 # Diagnostics
 @app.route("/_diag")
 def _diag():
