@@ -1,4 +1,4 @@
-# app.py — Lake House bookings (Render-safe, single-file, self-healing templates + accounts/history/exports)
+# app.py — Lake House bookings (Render-safe, single-file, self-healing templates + accounts/history/exports + landing/dashboard/request flow)
 import os, sys
 import socket
 import json, csv
@@ -67,7 +67,6 @@ class Member(db.Model):
     password_hash = db.Column(db.String(255), nullable=True)
     is_active = db.Column(db.Boolean, default=True, nullable=False)
 
-    # Account helpers
     def set_password(self, password: str):
         self.password_hash = generate_password_hash(password)
 
@@ -146,19 +145,6 @@ class AdminLoginForm(FlaskForm):
     password = PasswordField("Password", validators=[DataRequired()])
     submit = SubmitField("Sign in")
 
-class MemberRegisterForm(FlaskForm):
-    name = StringField("Full name", validators=[DataRequired(), Length(max=120)])
-    email = StringField("Email", validators=[DataRequired(), Email()])
-    phone = StringField("Phone (optional)")
-    member_type = SelectField("Membership Type", choices=[("due","Due-paying member"),("non_due","Non due-paying member")], validators=[DataRequired()])
-    password = PasswordField("Password", validators=[DataRequired(), Length(min=6, max=128)])
-    submit = SubmitField("Create account")
-
-class MemberLoginForm(FlaskForm):
-    email = StringField("Email", validators=[DataRequired(), Email()])
-    password = PasswordField("Password", validators=[DataRequired()])
-    submit = SubmitField("Sign in")
-
 class SignupForm(FlaskForm):
     name = StringField("Full name", validators=[DataRequired(), Length(max=120)])
     email = StringField("Email", validators=[DataRequired(), Email()])
@@ -171,7 +157,9 @@ class SigninForm(FlaskForm):
     password = PasswordField("Password", validators=[DataRequired()])
     submit = SubmitField("Sign in")
 
-# --- SELF-HEALING TEMPLATES ---
+# -----------------------------
+# Self-healing templates
+# -----------------------------
 DEFAULT_TEMPLATES = {
     "base.html": """<!doctype html>
 <html lang="en"><head>
@@ -191,14 +179,15 @@ DEFAULT_TEMPLATES = {
     <nav>
       <ul><li><strong>Lake House Bookings</strong></li></ul>
       <ul>
-        <li><a href="{{ url_for('home') }}">Request</a></li>
-        <li><a href="{{ url_for('calendar_view') }}">Calendar</a></li>
-        <li><a href="{{ url_for('calendar_ics') }}">ICS feed</a></li>
-
+        <li><a href="{{ url_for('landing') }}">Home</a></li>
         {% if session.get('user_member_id') %}
-          <li><a href="{{ url_for('my_requests') }}">My requests</a></li>
+          <li><a href="{{ url_for('dashboard') }}">Dashboard</a></li>
+          <li><a href="{{ url_for('request_booking') }}">Request booking</a></li>
+          <li><a href="{{ url_for('calendar_view') }}">Calendar</a></li>
+          <li><a href="{{ url_for('calendar_ics') }}">ICS feed</a></li>
           <li><a href="{{ url_for('signout') }}">Sign out</a></li>
         {% else %}
+          <li><a href="{{ url_for('calendar_view') }}">Calendar</a></li>
           <li><a href="{{ url_for('signin') }}">Sign in</a></li>
           <li><a href="{{ url_for('signup') }}">Create account</a></li>
         {% endif %}
@@ -227,7 +216,67 @@ DEFAULT_TEMPLATES = {
   </main>
 </body></html>""",
 
-    "home.html": """{% extends "base.html" %}
+    "landing.html": """{% extends "base.html" %}
+{% block content %}
+<section style="text-align:center; margin-top:2rem;">
+  <h1>Welcome to Lake House Bookings</h1>
+  <p>Sign in to view your dashboard and manage your stays.</p>
+  <p>
+    <a href="{{ url_for('signin') }}" role="button">Sign in</a>
+    <a href="{{ url_for('signup') }}" role="button" class="secondary">Create account</a>
+  </p>
+</section>
+{% endblock %}""",
+
+    "dashboard.html": """{% extends "base.html" %}
+{% block content %}
+<h2>Dashboard</h2>
+<p><strong>{{ me.name }}</strong> &lt;{{ me.email }}&gt;</p>
+
+<p>
+  <a href="{{ url_for('request_booking') }}" role="button">Request a booking</a>
+</p>
+
+<h3>Upcoming bookings</h3>
+{% if upcoming %}
+<table role="grid">
+  <thead><tr><th>Dates</th><th>Status</th><th>Notes</th><th>Created</th></tr></thead>
+  <tbody>
+  {% for r in upcoming %}
+    <tr>
+      <td>{{ r.start_date }} → {{ r.end_date }}</td>
+      <td><span class="badge due">{{ r.status }}</span></td>
+      <td>{{ r.notes or "-" }}</td>
+      <td><small>{{ r.created_at.strftime("%Y-%m-%d %H:%M") }}</small></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No upcoming bookings.</p>
+{% endif %}
+
+<h3>Pending requests</h3>
+{% if pending %}
+<table role="grid">
+  <thead><tr><th>Dates</th><th>Status</th><th>Notes</th><th>Created</th></tr></thead>
+  <tbody>
+  {% for r in pending %}
+    <tr>
+      <td>{{ r.start_date }} → {{ r.end_date }}</td>
+      <td><span class="tag">{{ r.status }}</span></td>
+      <td>{{ r.notes or "-" }}</td>
+      <td><small>{{ r.created_at.strftime("%Y-%m-%d %H:%M") }}</small></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No pending requests.</p>
+{% endif %}
+{% endblock %}""",
+
+    "request_form.html": """{% extends "base.html" %}
 {% block content %}
 <h2>Request time at the Lake House</h2>
 <form method="POST">
@@ -427,59 +476,7 @@ DEFAULT_TEMPLATES = {
   </tbody>
 </table>
 {% else %}
-<p>You don’t have any requests yet. <a href="{{ url_for('home') }}">Make one now</a>.</p>
-{% endif %}
-{% endblock %}""",
-
-    "member_login.html": """{% extends "base.html" %}
-{% block content %}
-<h2>Sign in</h2>
-<form method="POST">
-  {{ form.hidden_tag() }}
-  <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
-  <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
-  <button type="submit">Sign in</button>
-</form>
-<p>No account? <a href="{{ url_for('account_register') }}">Register</a>.</p>
-{% endblock %}""",
-
-    "member_register.html": """{% extends "base.html" %}
-{% block content %}
-<h2>Create an account</h2>
-<form method="POST">
-  {{ form.hidden_tag() }}
-  <div class="grid">
-    <label>{{ form.name.label }} {{ form.name(size=32) }}</label>
-    <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
-    <label>{{ form.phone.label }} {{ form.phone(size=20) }}</label>
-    <label>{{ form.member_type.label }} {{ form.member_type() }}</label>
-    <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
-  </div>
-  <button type="submit">Create account</button>
-</form>
-<p>Already have an account? <a href="{{ url_for('account_login') }}">Sign in</a>.</p>
-{% endblock %}""",
-
-    "member_requests.html": """{% extends "base.html" %}
-{% block content %}
-<h2>My requests</h2>
-<p><strong>{{ me.name }}</strong> &lt;{{ me.email }}&gt;</p>
-{% if requests %}
-<table role="grid">
-  <thead><tr><th>Dates</th><th>Status</th><th>Notes</th><th>Created</th></tr></thead>
-  <tbody>
-  {% for r in requests %}
-    <tr>
-      <td>{{ r.start_date }} → {{ r.end_date }}</td>
-      <td>{{ r.status }}</td>
-      <td>{{ r.notes or "" }}</td>
-      <td>{{ r.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
-    </tr>
-  {% endfor %}
-  </tbody>
-</table>
-{% else %}
-<p>No requests yet. <a href="{{ url_for('home') }}">Make one</a>.</p>
+<p>You don’t have any requests yet. <a href="{{ url_for('request_booking') }}">Make one now</a>.</p>
 {% endif %}
 {% endblock %}""",
 }
@@ -688,7 +685,7 @@ def _parse_gcal_date_or_datetime(when: dict):
     Accept a Google Calendar 'start'/'end' dict:
       - {'date': 'YYYY-MM-DD'}  (all-day, end is exclusive)
       - {'dateTime': 'YYYY-MM-DDTHH:MM:SS[.sss]Z|±HH:MM'}
-    Return date (YYYY-MM-DD) as a date() for start/end (treat timed by date component).
+    Return a date() for the start/end (timed events treated by their date component).
     """
     if "date" in when and when["date"]:
         d = datetime.fromisoformat(when["date"])
@@ -702,6 +699,7 @@ def _parse_gcal_date_or_datetime(when: dict):
         return datetime.fromisoformat(dt_raw).date()
     except Exception:
         try:
+            # Fallback: strip fractional secs or timezone crud
             main = dt_raw.split("+")[0].split("-")[0]
             return datetime.fromisoformat(main).date()
         except Exception:
@@ -722,6 +720,7 @@ def _gcal_list_events_between(start_date: date, end_date: date):
         print("[Calendar] Conflict check skipped (no token.json/creds).")
         return []
 
+    # timeMin inclusive; timeMax exclusive -> add 1 day at midnight
     time_min = datetime.combine(start_date, datetime.min.time()).isoformat() + "Z"
     time_max = datetime.combine(end_date + timedelta(days=1), datetime.min.time()).isoformat() + "Z"
 
@@ -823,7 +822,7 @@ def _ensure_db():
     if not getattr(app, "_db_inited", False):
         with app.app_context():
             db.create_all()
-            # MIGRATION NOTE: if your DB already exists, run these manually once
+            # helpful indexes
             try:
                 db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_booking_status ON booking_request(status);"))
                 db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_tx_created_at ON data_transaction(created_at);"))
@@ -835,12 +834,12 @@ def _ensure_db():
         app._db_inited = True
 
 # -----------------------------
-# Routes — Accounts
+# Routes — Accounts (members)
 # -----------------------------
 @app.route("/signup", methods=["GET", "POST"])
 def signup():
     if current_member():
-        return redirect(url_for("my_requests"))
+        return redirect(url_for("dashboard"))
     form = SignupForm()
     if form.validate_on_submit():
         email = form.email.data.strip().lower()
@@ -867,13 +866,13 @@ def signup():
         db.session.commit()
         login_member(m)
         flash("Account created. Welcome!", "success")
-        return redirect(url_for("my_requests"))
+        return redirect(url_for("dashboard"))
     return render_template("auth_signup.html", form=form)
 
 @app.route("/signin", methods=["GET", "POST"])
 def signin():
     if current_member():
-        return redirect(url_for("my_requests"))
+        return redirect(url_for("dashboard"))
     form = SigninForm()
     if form.validate_on_submit():
         email = form.email.data.strip().lower()
@@ -883,15 +882,16 @@ def signin():
         else:
             login_member(m)
             flash("Signed in.", "success")
-            return redirect(url_for("my_requests"))
+            return redirect(url_for("dashboard"))
     return render_template("auth_signin.html", form=form)
 
 @app.route("/signout")
 def signout():
     logout_member()
     flash("Signed out.", "info")
-    return redirect(url_for("home"))
+    return redirect(url_for("landing"))
 
+# Legacy member request view (kept, but dashboard is primary)
 @app.route("/me/requests")
 def my_requests():
     m = current_member()
@@ -904,95 +904,59 @@ def my_requests():
             .all())
     return render_template("my_requests.html", rows=rows)
 
-# (Optional legacy member endpoints retained, now using unified session helpers)
-@app.route("/account/register", methods=["GET", "POST"])
-def account_register():
+# -----------------------------
+# Routes — Landing, Dashboard, Request flow
+# -----------------------------
+@app.route("/", methods=["GET"])
+def landing():
+    # If already signed in, go straight to the dashboard
     if current_member():
-        return redirect(url_for("account_requests"))
-    form = MemberRegisterForm()
-    if form.validate_on_submit():
-        email = form.email.data.strip().lower()
-        existing = Member.query.filter(db.func.lower(Member.email) == email).first()
-        if existing:
-            flash("An account with that email already exists. Try signing in.", "warning")
-            return redirect(url_for("account_login"))
+        return redirect(url_for("dashboard"))
+    return render_template("landing.html")
 
-        m = Member(
-            name=form.name.data.strip(),
-            email=email,
-            phone=form.phone.data.strip() if form.phone.data else None,
-            member_type=form.member_type.data,
-        )
-        m.set_password(form.password.data)
-        db.session.add(m)
-        db.session.commit()
-        login_member(m)
-        flash("Welcome! Your account was created.", "success")
-        return redirect(url_for("account_requests"))
-    return render_template("member_register.html", form=form)
+@app.route("/dashboard")
+def dashboard():
+    m = current_member()
+    if not m:
+        flash("Please sign in to view your dashboard.", "warning")
+        return redirect(url_for("signin"))
 
-@app.route("/account/login", methods=["GET", "POST"])
-def account_login():
-    if current_member():
-        return redirect(url_for("account_requests"))
-    form = MemberLoginForm()
-    if form.validate_on_submit():
-        email = form.email.data.strip().lower()
-        m = Member.query.filter(db.func.lower(Member.email) == email).first()
-        if not m or not m.check_password(form.password.data):
-            flash("Invalid email or password.", "danger")
-        else:
-            login_member(m)
-            flash("Signed in.", "success")
-            return redirect(url_for("account_requests"))
-    return render_template("member_login.html", form=form)
-
-@app.route("/account/logout")
-def account_logout():
-    logout_member()
-    flash("Signed out.", "info")
-    return redirect(url_for("home"))
-
-@app.route("/account/requests")
-def account_requests():
-    me = current_member()
-    if not me:
-        flash("Please sign in to view your requests.", "warning")
-        return redirect(url_for("account_login"))
-    my_reqs = (BookingRequest.query
-               .filter(BookingRequest.member_id == me.id)
+    today = date.today()
+    upcoming = (BookingRequest.query
+                .filter(BookingRequest.member_id == m.id,
+                        BookingRequest.status == "approved",
+                        BookingRequest.end_date >= today)
+                .order_by(BookingRequest.start_date.asc())
+                .all())
+    pending = (BookingRequest.query
+               .filter(BookingRequest.member_id == m.id,
+                       BookingRequest.status == "pending")
                .order_by(BookingRequest.created_at.desc())
                .all())
-    return render_template("member_requests.html", me=me, requests=my_reqs)
 
-# -----------------------------
-# Routes — Core
-# -----------------------------
-@app.route("/", methods=["GET", "POST"])
-def home():
-    me = current_member()
+    return render_template("dashboard.html", me=m, upcoming=upcoming, pending=pending)
+
+@app.route("/request", methods=["GET", "POST"])
+def request_booking():
+    m = current_member()
     form = RequestForm()
 
     # Prefill if member is signed in
-    if me:
-        form.name.data = me.name
-        form.email.data = me.email
-        form.phone.data = me.phone
-        form.member_type.data = me.member_type
+    if m:
+        form.name.data = m.name
+        form.email.data = m.email
+        form.phone.data = m.phone
+        form.member_type.data = m.member_type
 
-    if request.method == "GET" and me:
-        form.name.data = me.name
-        form.email.data = me.email
-        form.phone.data = me.phone
+    if request.method == "GET" and m:
+        form.name.data = m.name
+        form.email.data = m.email
+        form.phone.data = m.phone
 
     if form.validate_on_submit():
-        # Choose the member record: current signed-in or create/update from email
-        if me:
-            member = me
-            member.name = form.name.data.strip()
-            member.phone = form.phone.data.strip() if form.phone.data else member.phone
-            member.member_type = form.member_type.data or member.member_type
-        else:
+        # Choose or create the member
+        member = m
+        if not member:
             member = Member.query.filter_by(email=form.email.data.strip()).first()
             if not member:
                 member = Member(
@@ -1007,6 +971,10 @@ def home():
                 member.name = form.name.data.strip()
                 member.phone = form.phone.data.strip() if form.phone.data else member.phone
                 member.member_type = form.member_type.data
+        else:
+            member.name = form.name.data.strip()
+            member.phone = form.phone.data.strip() if form.phone.data else member.phone
+            member.member_type = form.member_type.data or member.member_type
 
         br = BookingRequest(
             member_id=member.id,
@@ -1018,12 +986,11 @@ def home():
         db.session.commit()
         _snapshot_booking(br)  # snapshot initial "pending"
 
-        # DB conflicts (non-blocking at request time)
+        # Conflicts (non-blocking notices)
         conflicts = find_conflicts(br.start_date, br.end_date)
         if conflicts:
             flash("Heads up: those dates overlap with an approved booking. Admin will review.", "warning")
 
-        # Google Calendar conflicts (non-blocking at request time)
         gc_conflicts = find_calendar_conflicts(br.start_date, br.end_date)
         if gc_conflicts:
             flash("Google Calendar shows overlapping events: " + "; ".join(gc_conflicts), "warning")
@@ -1052,15 +1019,15 @@ def home():
 
         _log("create", br.id, f"Created by {member.email}")
         flash("Request submitted! You'll receive an email confirmation.", "success")
-        return redirect(url_for("home"))
+        return redirect(url_for("dashboard"))
 
-    return render_template("home.html", form=form)
+    return render_template("request_form.html", form=form)
 
-# Friendly aliases to home
+# Friendly aliases → landing
 @app.route("/index")
 @app.route("/home")
 def index_alias():
-    return redirect(url_for("home"), code=302)
+    return redirect(url_for("landing"), code=302)
 
 # Favicon (avoid noisy 404s)
 @app.route("/favicon.ico")
@@ -1070,6 +1037,7 @@ def favicon():
 # Calendar embed
 @app.route("/calendar")
 def calendar_view():
+    # Prefer a dedicated embed ID if you have one; else fall back to GOOGLE_CALENDAR_ID
     cal_id = os.getenv("GOOGLE_CALENDAR_EMBED_ID") or os.getenv("GOOGLE_CALENDAR_ID")
     embed_src = None
     if cal_id:
@@ -1125,7 +1093,7 @@ def admin_login():
 def admin_logout():
     session.clear()
     flash("Logged out.", "info")
-    return redirect(url_for("home"))
+    return redirect(url_for("landing"))
 
 @app.route("/admin/requests")
 def admin_requests():
@@ -1178,10 +1146,10 @@ def admin_requests():
         approved=approved,
         denied=denied,
         logs=AuditLog.query.order_by(AuditLog.created_at.desc()).limit(50).all(),
-        gcal_conf=gcal_conf,  # pass to template
+        gcal_conf=gcal_conf,
     )
 
-# Actions
+# Admin actions
 @app.post("/admin/requests/<int:req_id>/approve")
 def approve_request(req_id):
     if not is_admin():
