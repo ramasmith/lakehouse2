@@ -294,33 +294,88 @@ _ensure_templates_present()
 # -----------------------------
 # Helpers: Email, SMS, Calendar
 # -----------------------------
-def send_email(to_email, subject, body):
-    smtp_host = os.getenv("SMTP_HOST")
-    smtp_port = os.getenv("SMTP_PORT")
-    smtp_user = os.getenv("SMTP_USER")
-    smtp_pass = os.getenv("SMTP_PASS")
-    email_from = os.getenv("EMAIL_FROM", "no-reply@lakehouse.local")
-    if not (smtp_host and smtp_port and smtp_user and smtp_pass):
-        print(f"[EMAIL DRY-RUN] To: {to_email} | Subject: {subject}\n{body}")
-        return
-    msg = MIMEText(body, "plain")
-    msg["Subject"] = subject
-    msg["From"] = email_from
-    msg["To"] = to_email
-    with smtplib.SMTP(smtp_host, int(smtp_port)) as server:
-        server.starttls()
-        server.login(smtp_user, smtp_pass)
-        server.send_message(msg)
+def send_email(to_email: str, subject: str, body: str) -> bool:
+    """
+    Supports STARTTLS (587), SSL (465), or plain (25). Returns True on success.
+    Env:
+      SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM
+      SMTP_SECURE = "starttls" (default) | "ssl" | "none"
+      SMTP_TIMEOUT = seconds (default 20)
+    """
+    host = os.getenv("SMTP_HOST")
+    port = int(os.getenv("SMTP_PORT", "0") or 0)
+    user = os.getenv("SMTP_USER")
+    pwd  = os.getenv("SMTP_PASS")
+    from_addr = os.getenv("EMAIL_FROM", user or "no-reply@lakehouse.local")
+    secure = (os.getenv("SMTP_SECURE", "starttls") or "starttls").lower()
+    timeout = int(os.getenv("SMTP_TIMEOUT", "20"))
 
-def send_sms(to_number, body):
-    sid = os.getenv("TWILIO_ACCOUNT_SID")
+    if not host or not port:
+        print(f"[EMAIL DRY-RUN] To: {to_email} | Subj: {subject}\n{body}")
+        return True
+
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = from_addr
+    msg["To"] = to_email
+
+    try:
+        if secure == "ssl" or port == 465:
+            with smtplib.SMTP_SSL(host=host, port=port, timeout=timeout) as server:
+                if user and pwd:
+                    server.login(user, pwd)
+                server.send_message(msg)
+        else:
+            # plain or starttls
+            with smtplib.SMTP(host=host, port=port, timeout=timeout) as server:
+                server.ehlo()
+                if secure == "starttls" or port == 587:
+                    server.starttls()
+                    server.ehlo()
+                if user and pwd:
+                    server.login(user, pwd)
+                server.send_message(msg)
+        print(f"[EMAIL OK] sent → {to_email}")
+        return True
+    except (smtplib.SMTPException, socket.error) as e:
+        print(f"[EMAIL ERROR] {type(e).__name__}: {e}")
+        return False
+
+try:
+    from twilio.rest import Client as TwilioClient
+except Exception:
+    TwilioClient = None
+
+def send_sms(to_number: str, body: str) -> bool:
+    """
+    Sends SMS via Twilio. Returns True on success.
+    Env:
+      TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER
+      (or TWILIO_MESSAGING_SERVICE_SID)
+    """
+    sid   = os.getenv("TWILIO_ACCOUNT_SID")
     token = os.getenv("TWILIO_AUTH_TOKEN")
     from_number = os.getenv("TWILIO_FROM_NUMBER")
-    if not (sid and token and from_number and to_number and TwilioClient):
+    msid  = os.getenv("TWILIO_MESSAGING_SERVICE_SID")
+
+    if not TwilioClient or not sid or not token or (not from_number and not msid):
         print(f"[SMS DRY-RUN] To: {to_number} | {body}")
-        return
-    client = TwilioClient(sid, token)
-    client.messages.create(to=to_number, from_=from_number, body=body)
+        return True
+
+    try:
+        client = TwilioClient(sid, token)
+        kwargs = {"to": to_number, "body": body}
+        if msid:
+            kwargs["messaging_service_sid"] = msid
+        else:
+            kwargs["from_"] = from_number
+
+        msg = client.messages.create(**kwargs)
+        print(f"[SMS OK] sid={msg.sid} to={to_number}")
+        return True
+    except Exception as e:
+        print(f"[SMS ERROR] {e!r}")
+        return False
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
