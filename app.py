@@ -6,7 +6,6 @@ from io import StringIO
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from urllib.parse import quote
-from werkzeug.security import generate_password_hash, check_password_hash
 
 from flask import (
     Flask, render_template, render_template_string, request,
@@ -67,13 +66,13 @@ class Member(db.Model):
     # Accounts
     password_hash = db.Column(db.String(255), nullable=True)
     is_active = db.Column(db.Boolean, default=True, nullable=False)
-    #password_hash = db.Column(db.String(255), nullable=True)  # new
 
-def set_password(self, password: str):
-    self.password_hash = generate_password_hash(password)
+    # Account helpers
+    def set_password(self, password: str):
+        self.password_hash = generate_password_hash(password)
 
-def check_password(self, password: str) -> bool:
-    return bool(self.password_hash) and check_password_hash(self.password_hash, password)
+    def check_password(self, password: str) -> bool:
+        return bool(self.password_hash) and check_password_hash(self.password_hash, password)
 
 
 class BookingRequest(db.Model):
@@ -171,63 +170,8 @@ class SigninForm(FlaskForm):
     email = StringField("Email", validators=[DataRequired(), Email()])
     password = PasswordField("Password", validators=[DataRequired()])
     submit = SubmitField("Sign in")
-    
 
 # --- SELF-HEALING TEMPLATES ---
-DEFAULT_TEMPLATES.update({
-    "member_login.html": """{% extends "base.html" %}
-{% block content %}
-<h2>Sign in</h2>
-<form method="POST">
-  {{ form.hidden_tag() }}
-  <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
-  <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
-  <button type="submit">Sign in</button>
-</form>
-<p>No account? <a href="{{ url_for('account_register') }}">Register</a>.</p>
-{% endblock %}""",
-
-    "member_register.html": """{% extends "base.html" %}
-{% block content %}
-<h2>Create an account</h2>
-<form method="POST">
-  {{ form.hidden_tag() }}
-  <div class="grid">
-    <label>{{ form.name.label }} {{ form.name(size=32) }}</label>
-    <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
-    <label>{{ form.phone.label }} {{ form.phone(size=20) }}</label>
-    <label>{{ form.member_type.label }} {{ form.member_type() }}</label>
-    <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
-  </div>
-  <button type="submit">Create account</button>
-</form>
-<p>Already have an account? <a href="{{ url_for('account_login') }}">Sign in</a>.</p>
-{% endblock %}""",
-
-    "member_requests.html": """{% extends "base.html" %}
-{% block content %}
-<h2>My requests</h2>
-<p><strong>{{ me.name }}</strong> &lt;{{ me.email }}&gt;</p>
-{% if requests %}
-<table role="grid">
-  <thead><tr><th>Dates</th><th>Status</th><th>Notes</th><th>Created</th></tr></thead>
-  <tbody>
-  {% for r in requests %}
-    <tr>
-      <td>{{ r.start_date }} → {{ r.end_date }}</td>
-      <td>{{ r.status }}</td>
-      <td>{{ r.notes or "" }}</td>
-      <td>{{ r.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
-    </tr>
-  {% endfor %}
-  </tbody>
-</table>
-{% else %}
-<p>No requests yet. <a href="{{ url_for('home') }}">Make one</a>.</p>
-{% endif %}
-{% endblock %}""",
-})
-
 DEFAULT_TEMPLATES = {
     "base.html": """<!doctype html>
 <html lang="en"><head>
@@ -336,7 +280,7 @@ DEFAULT_TEMPLATES = {
       <td>{{ r.start_date }} → {{ r.end_date }}</td>
       <td>{{ r.notes }}</td>
       <td>
-        {% set g = pending_conflicts.get(r.id) %}
+        {% set g = gcal_conf.get(r.id) %}
         {% if g %}
           <span class="badge non_due">GCal conflict</span>
           <details style="margin-top:0.25rem;">
@@ -484,6 +428,58 @@ DEFAULT_TEMPLATES = {
 </table>
 {% else %}
 <p>You don’t have any requests yet. <a href="{{ url_for('home') }}">Make one now</a>.</p>
+{% endif %}
+{% endblock %}""",
+
+    "member_login.html": """{% extends "base.html" %}
+{% block content %}
+<h2>Sign in</h2>
+<form method="POST">
+  {{ form.hidden_tag() }}
+  <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
+  <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
+  <button type="submit">Sign in</button>
+</form>
+<p>No account? <a href="{{ url_for('account_register') }}">Register</a>.</p>
+{% endblock %}""",
+
+    "member_register.html": """{% extends "base.html" %}
+{% block content %}
+<h2>Create an account</h2>
+<form method="POST">
+  {{ form.hidden_tag() }}
+  <div class="grid">
+    <label>{{ form.name.label }} {{ form.name(size=32) }}</label>
+    <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
+    <label>{{ form.phone.label }} {{ form.phone(size=20) }}</label>
+    <label>{{ form.member_type.label }} {{ form.member_type() }}</label>
+    <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
+  </div>
+  <button type="submit">Create account</button>
+</form>
+<p>Already have an account? <a href="{{ url_for('account_login') }}">Sign in</a>.</p>
+{% endblock %}""",
+
+    "member_requests.html": """{% extends "base.html" %}
+{% block content %}
+<h2>My requests</h2>
+<p><strong>{{ me.name }}</strong> &lt;{{ me.email }}&gt;</p>
+{% if requests %}
+<table role="grid">
+  <thead><tr><th>Dates</th><th>Status</th><th>Notes</th><th>Created</th></tr></thead>
+  <tbody>
+  {% for r in requests %}
+    <tr>
+      <td>{{ r.start_date }} → {{ r.end_date }}</td>
+      <td>{{ r.status }}</td>
+      <td>{{ r.notes or "" }}</td>
+      <td>{{ r.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No requests yet. <a href="{{ url_for('home') }}">Make one</a>.</p>
 {% endif %}
 {% endblock %}""",
 }
@@ -706,7 +702,6 @@ def _parse_gcal_date_or_datetime(when: dict):
         return datetime.fromisoformat(dt_raw).date()
     except Exception:
         try:
-            # Fallback: strip fractional secs or timezone crud
             main = dt_raw.split("+")[0].split("-")[0]
             return datetime.fromisoformat(main).date()
         except Exception:
@@ -828,7 +823,7 @@ def _ensure_db():
     if not getattr(app, "_db_inited", False):
         with app.app_context():
             db.create_all()
-            # MIGRATION NOTE: if your DB already exists, run these manually once (via SQLite shell or one-off route)
+            # MIGRATION NOTE: if your DB already exists, run these manually once
             try:
                 db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_booking_status ON booking_request(status);"))
                 db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_tx_created_at ON data_transaction(created_at);"))
@@ -874,72 +869,6 @@ def signup():
         flash("Account created. Welcome!", "success")
         return redirect(url_for("my_requests"))
     return render_template("auth_signup.html", form=form)
-@app.route("/account/register", methods=["GET", "POST"])
-def account_register():
-    if session.get("member_id"):
-        return redirect(url_for("account_requests"))
-    form = MemberRegisterForm()
-    if form.validate_on_submit():
-        email = form.email.data.strip().lower()
-        existing = Member.query.filter(db.func.lower(Member.email) == email).first()
-        if existing:
-            flash("An account with that email already exists. Try signing in.", "warning")
-            return redirect(url_for("account_login"))
-
-        m = Member(
-            name=form.name.data.strip(),
-            email=email,
-            phone=form.phone.data.strip() if form.phone.data else None,
-            member_type=form.member_type.data,
-        )
-        m.set_password(form.password.data)
-        db.session.add(m)
-        db.session.commit()
-        session["member_id"] = m.id
-        flash("Welcome! Your account was created.", "success")
-        return redirect(url_for("account_requests"))
-    # render (self-healing template added below)
-    return render_template("member_register.html", form=form)
-
-@app.route("/account/login", methods=["GET", "POST"])
-def account_login():
-    if session.get("member_id"):
-        return redirect(url_for("account_requests"))
-    form = MemberLoginForm()
-    if form.validate_on_submit():
-        email = form.email.data.strip().lower()
-        m = Member.query.filter(db.func.lower(Member.email) == email).first()
-        if not m or not m.check_password(form.password.data):
-            flash("Invalid email or password.", "danger")
-        else:
-            session["member_id"] = m.id
-            flash("Signed in.", "success")
-            return redirect(url_for("account_requests"))
-    return render_template("member_login.html", form=form)
-
-@app.route("/account/logout")
-def account_logout():
-    session.pop("member_id", None)
-    flash("Signed out.", "info")
-    #return redirect(url_for("home"))
-# Redirect alias (for convenience)
-@app.route("/x")
-def x_alias():
-    return redirect(url_for("home"), code=302)
-
-
-@app.route("/account/requests")
-def account_requests():
-    if not session.get("member_id"):
-        flash("Please sign in to view your requests.", "warning")
-        return redirect(url_for("account_login"))
-    me = Member.query.get_or_404(session["member_id"])
-    my_reqs = (BookingRequest.query
-               .filter(BookingRequest.member_id == me.id)
-               .order_by(BookingRequest.created_at.desc())
-               .all())
-    return render_template("member_requests.html", me=me, requests=my_reqs)
-
 
 @app.route("/signin", methods=["GET", "POST"])
 def signin():
@@ -975,6 +904,67 @@ def my_requests():
             .all())
     return render_template("my_requests.html", rows=rows)
 
+# (Optional legacy member endpoints retained, now using unified session helpers)
+@app.route("/account/register", methods=["GET", "POST"])
+def account_register():
+    if current_member():
+        return redirect(url_for("account_requests"))
+    form = MemberRegisterForm()
+    if form.validate_on_submit():
+        email = form.email.data.strip().lower()
+        existing = Member.query.filter(db.func.lower(Member.email) == email).first()
+        if existing:
+            flash("An account with that email already exists. Try signing in.", "warning")
+            return redirect(url_for("account_login"))
+
+        m = Member(
+            name=form.name.data.strip(),
+            email=email,
+            phone=form.phone.data.strip() if form.phone.data else None,
+            member_type=form.member_type.data,
+        )
+        m.set_password(form.password.data)
+        db.session.add(m)
+        db.session.commit()
+        login_member(m)
+        flash("Welcome! Your account was created.", "success")
+        return redirect(url_for("account_requests"))
+    return render_template("member_register.html", form=form)
+
+@app.route("/account/login", methods=["GET", "POST"])
+def account_login():
+    if current_member():
+        return redirect(url_for("account_requests"))
+    form = MemberLoginForm()
+    if form.validate_on_submit():
+        email = form.email.data.strip().lower()
+        m = Member.query.filter(db.func.lower(Member.email) == email).first()
+        if not m or not m.check_password(form.password.data):
+            flash("Invalid email or password.", "danger")
+        else:
+            login_member(m)
+            flash("Signed in.", "success")
+            return redirect(url_for("account_requests"))
+    return render_template("member_login.html", form=form)
+
+@app.route("/account/logout")
+def account_logout():
+    logout_member()
+    flash("Signed out.", "info")
+    return redirect(url_for("home"))
+
+@app.route("/account/requests")
+def account_requests():
+    me = current_member()
+    if not me:
+        flash("Please sign in to view your requests.", "warning")
+        return redirect(url_for("account_login"))
+    my_reqs = (BookingRequest.query
+               .filter(BookingRequest.member_id == me.id)
+               .order_by(BookingRequest.created_at.desc())
+               .all())
+    return render_template("member_requests.html", me=me, requests=my_reqs)
+
 # -----------------------------
 # Routes — Core
 # -----------------------------
@@ -984,32 +974,24 @@ def home():
     form = RequestForm()
 
     # Prefill if member is signed in
-    if session.get("member_id"):
-        me = Member.query.get(session["member_id"])
     if me:
         form.name.data = me.name
         form.email.data = me.email
         form.phone.data = me.phone
         form.member_type.data = me.member_type
 
-    # Prefill contact fields if signed in
     if request.method == "GET" and me:
         form.name.data = me.name
         form.email.data = me.email
         form.phone.data = me.phone
 
-member = None
-if session.get("member_id"):
-    member = Member.query.get(session["member_id"])
-if not member:
-    member = Member.query.filter_by(email=form.email.data.strip()).first()
-
     if form.validate_on_submit():
-        # If logged in, always use that member record
+        # Choose the member record: current signed-in or create/update from email
         if me:
             member = me
             member.name = form.name.data.strip()
             member.phone = form.phone.data.strip() if form.phone.data else member.phone
+            member.member_type = form.member_type.data or member.member_type
         else:
             member = Member.query.filter_by(email=form.email.data.strip()).first()
             if not member:
@@ -1176,7 +1158,7 @@ def admin_requests():
         .all()
     )
 
-    # NEW: Build a dict of {booking_request_id: [conflict strings]} for pending items
+    # Build a dict of {booking_request_id: [conflict strings]} for pending items
     gcal_conf = {}
     try:
         if GOOGLE_OK and os.getenv("GOOGLE_CALENDAR_ID"):
@@ -1196,9 +1178,8 @@ def admin_requests():
         approved=approved,
         denied=denied,
         logs=AuditLog.query.order_by(AuditLog.created_at.desc()).limit(50).all(),
-        gcal_conf=gcal_conf,  # <-- pass to template
+        gcal_conf=gcal_conf,  # pass to template
     )
-
 
 # Actions
 @app.post("/admin/requests/<int:req_id>/approve")
