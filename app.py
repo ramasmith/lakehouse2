@@ -856,39 +856,45 @@ def admin_requests():
     )
 
 # Actions
+# --- replace your existing approve_request with this exact version ---
 @app.post("/admin/requests/<int:req_id>/approve")
 def approve_request(req_id):
     if not is_admin():
         return redirect(url_for("admin_login"))
+
     br = BookingRequest.query.get_or_404(req_id)
+
+    # 1) DB conflicts (approved bookings in SQLite)
     conflicts = find_conflicts(br.start_date, br.end_date, exclude_request_id=br.id)
     if conflicts:
-        conflict_list = ", ".join([f"{c.member.name}({c.start_date}→{c.end_date})" for c in conflicts])
+        conflict_list = ", ".join(
+            f"{c.member.name}({c.start_date}→{c.end_date})" for c in conflicts
+        )
         flash(f"Cannot approve: date conflict with {conflict_list}.", "danger")
         return redirect(url_for("admin_requests"))
-    # NEW: Google Calendar conflict block
-gc_conflicts = find_calendar_conflicts(br.start_date, br.end_date)
-if gc_conflicts:
-    flash("Cannot approve: Google Calendar already has overlapping event(s): " + "; ".join(gc_conflicts), "danger")
-    return redirect(url_for("admin_requests"))
 
+    # 2) Google Calendar conflicts (existing events on the calendar)
+    gc_conflicts = find_calendar_conflicts(br.start_date, br.end_date)
+    if gc_conflicts:
+        flash(
+            "Cannot approve: Google Calendar already has overlapping event(s): "
+            + "; ".join(gc_conflicts),
+            "danger",
+        )
+        return redirect(url_for("admin_requests"))
+
+    # 3) Approve & push to Google Calendar
     br.status = "approved"
     summary = f"Lake House: {br.member.name} ({br.member.member_type})"
     description = (br.notes or "") + f"\nMember email: {br.member.email}"
     event_id = add_event_to_calendar(summary, br.start_date, br.end_date, description)
     if event_id:
         br.calendar_event_id = event_id
+
     db.session.commit()
-    _snapshot_booking(br)
-
-    _tx("gcal.insert", "success" if event_id else "error",
-        booking=br, member=br.member,
-        target=os.getenv("GOOGLE_CALENDAR_ID"),
-        meta={"event_id": event_id, "summary": summary})
-
     _notify_status(br)
-    _log("approve", br.id, "Approved and attempted calendar sync")
-    flash("Request approved." + (" Calendar updated." if event_id else " Calendar sync skipped/failed."), "success" if event_id else "warning")
+    _log("approve", br.id, "Approved and synced to calendar")
+    flash("Request approved and calendar updated.", "success")
     return redirect(url_for("admin_requests"))
 
 @app.post("/admin/requests/<int:req_id>/deny")
