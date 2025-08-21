@@ -1,9 +1,8 @@
-# app.py — Lake House bookings (Render-safe, single-file, self-healing templates + history/exports)
+# app.py — Lake House bookings (Render-safe, single-file, self-healing templates + accounts/history/exports)
 import os, sys
 import socket
 import json, csv
 from io import StringIO
-
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from urllib.parse import quote
@@ -21,6 +20,7 @@ from wtforms.validators import DataRequired, Email, Length
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import case, text
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # Notifications (SMTP)
 import smtplib
@@ -63,6 +63,9 @@ class Member(db.Model):
     email = db.Column(db.String(255), nullable=False)
     phone = db.Column(db.String(32), nullable=True)
     member_type = db.Column(db.String(32), nullable=False, default="non_due")  # "due" or "non_due"
+    # Accounts
+    password_hash = db.Column(db.String(255), nullable=True)
+    is_active = db.Column(db.Boolean, default=True, nullable=False)
 
 class BookingRequest(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -83,7 +86,7 @@ class AuditLog(db.Model):
     details = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-# NEW: Side-effect logging (emails, sms, calendar operations)
+# Side-effect logging (emails, sms, calendar operations)
 class DataTransaction(db.Model):
     __tablename__ = "data_transaction"
     id = db.Column(db.Integer, primary_key=True)
@@ -98,7 +101,7 @@ class DataTransaction(db.Model):
     booking_request = db.relationship("BookingRequest", lazy=True)
     member = db.relationship("Member", lazy=True)
 
-# NEW: Snapshot of booking on each change (status, dates, notes)
+# Snapshot of booking on each change (status, dates, notes)
 class BookingRequestHistory(db.Model):
     __tablename__ = "booking_request_history"
     id = db.Column(db.Integer, primary_key=True)
@@ -135,6 +138,18 @@ class AdminLoginForm(FlaskForm):
     password = PasswordField("Password", validators=[DataRequired()])
     submit = SubmitField("Sign in")
 
+class SignupForm(FlaskForm):
+    name = StringField("Full name", validators=[DataRequired(), Length(max=120)])
+    email = StringField("Email", validators=[DataRequired(), Email()])
+    phone = StringField("Phone (optional)")
+    password = PasswordField("Password", validators=[DataRequired(), Length(min=6)])
+    submit = SubmitField("Create account")
+
+class SigninForm(FlaskForm):
+    email = StringField("Email", validators=[DataRequired(), Email()])
+    password = PasswordField("Password", validators=[DataRequired()])
+    submit = SubmitField("Sign in")
+
 # --- SELF-HEALING TEMPLATES ---
 DEFAULT_TEMPLATES = {
     "base.html": """<!doctype html>
@@ -158,9 +173,18 @@ DEFAULT_TEMPLATES = {
         <li><a href="{{ url_for('home') }}">Request</a></li>
         <li><a href="{{ url_for('calendar_view') }}">Calendar</a></li>
         <li><a href="{{ url_for('calendar_ics') }}">ICS feed</a></li>
+
+        {% if session.get('user_member_id') %}
+          <li><a href="{{ url_for('my_requests') }}">My requests</a></li>
+          <li><a href="{{ url_for('signout') }}">Sign out</a></li>
+        {% else %}
+          <li><a href="{{ url_for('signin') }}">Sign in</a></li>
+          <li><a href="{{ url_for('signup') }}">Create account</a></li>
+        {% endif %}
+
         {% if session.get('is_admin') %}
           <li><a href="{{ url_for('admin_requests') }}">Admin</a></li>
-          <li><a href="{{ url_for('admin_logout') }}">Logout</a></li>
+          <li><a href="{{ url_for('admin_logout') }}">Admin logout</a></li>
         {% else %}
           <li><a href="{{ url_for('admin_login') }}">Admin</a></li>
         {% endif %}
@@ -177,7 +201,7 @@ DEFAULT_TEMPLATES = {
     {% endwith %}
     {% block content %}{% endblock %}
     <footer style="margin-top:3rem; font-size:0.9rem; color:#64748b;">
-      Built with Flask • Conflict detection • Dues priority • Audit log • ICS feed
+      Built with Flask • Conflict detection • Dues priority • Audit log • ICS feed • Accounts
     </footer>
   </main>
 </body></html>""",
@@ -227,13 +251,29 @@ DEFAULT_TEMPLATES = {
 <h2>Pending Requests</h2>
 {% if pending %}
 <table role="grid">
-  <thead><tr><th>Member</th><th>Dates</th><th>Notes</th><th>Actions</th></tr></thead>
+  <thead><tr><th>Member</th><th>Dates</th><th>Notes</th><th>Conflicts</th><th>Actions</th></tr></thead>
   <tbody>
   {% for r in pending %}
     <tr>
       <td>{{ r.member.name }} ({{ r.member.member_type }})<br><small>{{ r.member.email }}</small></td>
       <td>{{ r.start_date }} → {{ r.end_date }}</td>
       <td>{{ r.notes }}</td>
+      <td>
+        {% set g = pending_conflicts.get(r.id) %}
+        {% if g %}
+          <span class="badge non_due">GCal conflict</span>
+          <details style="margin-top:0.25rem;">
+            <summary>details</summary>
+            <ul style="margin:0.25rem 0 0 1rem;">
+              {% for item in g %}
+                <li>{{ item }}</li>
+              {% endfor %}
+            </ul>
+          </details>
+        {% else %}
+          <span class="tag">none</span>
+        {% endif %}
+      </td>
       <td>
         <form method="POST" action="{{ url_for('approve_request', req_id=r.id) }}" style="display:inline;">
           <button>Approve</button>
@@ -310,6 +350,65 @@ DEFAULT_TEMPLATES = {
   </article>
 {% endif %}
 {% endblock %}""",
+
+    "auth_signup.html": """{% extends "base.html" %}
+{% block content %}
+<h2>Create account</h2>
+<form method="POST">
+  {{ form.hidden_tag() }}
+  <label>{{ form.name.label }} {{ form.name(size=32) }}</label>
+  <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
+  <label>{{ form.phone.label }} {{ form.phone(size=20) }}</label>
+  <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
+  <button type="submit">Create account</button>
+</form>
+<p>Already have an account? <a href="{{ url_for('signin') }}">Sign in</a></p>
+{% endblock %}""",
+
+    "auth_signin.html": """{% extends "base.html" %}
+{% block content %}
+<h2>Sign in</h2>
+<form method="POST">
+  {{ form.hidden_tag() }}
+  <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
+  <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
+  <button type="submit">Sign in</button>
+</form>
+<p>No account? <a href="{{ url_for('signup') }}">Create one</a></p>
+{% endblock %}""",
+
+    "my_requests.html": """{% extends "base.html" %}
+{% block content %}
+<h2>My requests</h2>
+{% if rows %}
+<table role="grid">
+  <thead><tr><th>Dates</th><th>Status</th><th>Notes</th><th>Calendar</th><th>Created</th></tr></thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.start_date }} → {{ r.end_date }}</td>
+      <td>
+        {% if r.status == 'approved' %}
+          <span class="badge due">approved</span>
+        {% elif r.status == 'pending' %}
+          <span class="tag">pending</span>
+        {% elif r.status == 'denied' %}
+          <span class="badge non_due">denied</span>
+        {% else %}
+          <span class="tag">{{ r.status }}</span>
+        {% endif %}
+      </td>
+      <td>{{ r.notes or '-' }}</td>
+      <td>{% if r.calendar_event_id %}<code>{{ r.calendar_event_id }}</code>{% else %}-{% endif %}</td>
+      <td><small>{{ r.created_at.strftime('%Y-%m-%d %H:%M') }}</small></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>You don’t have any requests yet. <a href="{{ url_for('home') }}">Make one now</a>.</p>
+{% endif %}
+{% endblock %}""",
 }
 
 def _ensure_templates_present():
@@ -325,6 +424,27 @@ def _ensure_templates_present():
 
 _ensure_templates_present()
 # --- END SELF-HEALING TEMPLATES ---
+
+# -----------------------------
+# Auth helpers (members) & admin helpers
+# -----------------------------
+def login_member(member: Member):
+    session["user_member_id"] = member.id
+
+def logout_member():
+    session.pop("user_member_id", None)
+
+def current_member():
+    mid = session.get("user_member_id")
+    if not mid:
+        return None
+    return Member.query.get(mid)
+
+def is_admin():
+    return bool(session.get("is_admin"))
+
+def current_admin_email():
+    return os.getenv("ADMIN_EMAIL") if is_admin() else None
 
 # -----------------------------
 # Helpers: Email, SMS, Calendar, Logging
@@ -490,34 +610,30 @@ def remove_event_from_calendar(event_id):
         return False
 
 # --- Google Calendar conflict checks ---------------------------------
-def _parse_gcal_date_or_datetime(when):
+def _parse_gcal_date_or_datetime(when: dict):
     """
-    Accepts a Google Calendar 'start'/'end' dict which may contain either:
-      - {'date': 'YYYY-MM-DD'}  (all-day, RFC 3339 date, end is exclusive)
-      - {'dateTime': 'YYYY-MM-DDTHH:MM:SSZ' or with offset}
-    Returns (start_date_inclusive, end_date_exclusive) as date objects.
+    Accept a Google Calendar 'start'/'end' dict:
+      - {'date': 'YYYY-MM-DD'}  (all-day, end is exclusive)
+      - {'dateTime': 'YYYY-MM-DDTHH:MM:SS[.sss]Z|±HH:MM'}
+    Return date (YYYY-MM-DD) as a date() for start/end (treat timed by date component).
     """
-    # All-day events
-    if "date" in when:
+    if "date" in when and when["date"]:
         d = datetime.fromisoformat(when["date"])
-        return d.date(), d.date()  # caller will add +1 for exclusive logic
-
-    # Timed events
+        return d.date()
     dt_raw = when.get("dateTime")
     if not dt_raw:
-        # Fallback: treat as zero-length today (shouldn't happen)
-        today = date.today()
-        return today, today
-
-    # Normalize 'Z' to '+00:00' so fromisoformat can parse
+        return date.today()
     if dt_raw.endswith("Z"):
         dt_raw = dt_raw[:-1] + "+00:00"
     try:
-        dt = datetime.fromisoformat(dt_raw)
+        return datetime.fromisoformat(dt_raw).date()
     except Exception:
-        # Last resort: strip timezone and parse naive
-        dt = datetime.fromisoformat(dt_raw.split("+")[0].split("-")[0])
-    return dt.date(), dt.date()
+        try:
+            # Fallback: strip fractional secs or timezone crud
+            main = dt_raw.split("+")[0].split("-")[0]
+            return datetime.fromisoformat(main).date()
+        except Exception:
+            return date.today()
 
 def _gcal_list_events_between(start_date: date, end_date: date):
     """
@@ -534,7 +650,6 @@ def _gcal_list_events_between(start_date: date, end_date: date):
         print("[Calendar] Conflict check skipped (no token.json/creds).")
         return []
 
-    # timeMin inclusive; timeMax exclusive -> add 1 day at midnight
     time_min = datetime.combine(start_date, datetime.min.time()).isoformat() + "Z"
     time_max = datetime.combine(end_date + timedelta(days=1), datetime.min.time()).isoformat() + "Z"
 
@@ -559,31 +674,22 @@ def find_calendar_conflicts(start_date: date, end_date: date):
     """
     items = _gcal_list_events_between(start_date, end_date)
     conflicts = []
+    req_start = start_date
+    req_end_exclusive = end_date + timedelta(days=1)
 
     for ev in items:
         s_raw = ev.get("start", {})
         e_raw = ev.get("end", {})
 
-        s_date, _ = _parse_gcal_date_or_datetime(s_raw)
-        e_date, _ = _parse_gcal_date_or_datetime(e_raw)
-
-        # Google all-day 'end' is exclusive; for timed events we treat end date as inclusive day
-        if "date" in e_raw:
-            g_start = s_date
+        g_start = _parse_gcal_date_or_datetime(s_raw)
+        if "date" in e_raw and e_raw.get("date"):
             g_end_exclusive = datetime.fromisoformat(e_raw["date"]).date()
         else:
-            # For timed events, consider the end date inclusive for overlap purposes by adding +1
-            g_start = s_date
-            g_end_exclusive = e_date + timedelta(days=1)
-
-        # Our requested window in exclusive form:
-        req_start = start_date
-        req_end_exclusive = end_date + timedelta(days=1)
+            g_end_exclusive = _parse_gcal_date_or_datetime(e_raw) + timedelta(days=1)
 
         overlaps = not (req_end_exclusive <= g_start or g_end_exclusive <= req_start)
         if overlaps:
             title = ev.get("summary") or "(untitled)"
-            # Display span as inclusive dates for humans
             disp_start = g_start.isoformat()
             disp_end = (g_end_exclusive - timedelta(days=1)).isoformat()
             conflicts.append(f"{title} [{disp_start} → {disp_end}]")
@@ -602,12 +708,6 @@ def find_conflicts(start_date, end_date, exclude_request_id=None):
     if exclude_request_id:
         q = q.filter(BookingRequest.id != exclude_request_id)
     return [r for r in q.all() if ranges_overlap(start_date, end_date, r.start_date, r.end_date)]
-
-def is_admin():
-    return bool(session.get("is_admin"))
-
-def current_admin_email():
-    return os.getenv("ADMIN_EMAIL") if is_admin() else None
 
 def _log(action, request_id, details=""):
     db.session.add(AuditLog(action=action, request_id=request_id, admin_email=current_admin_email(), details=details))
@@ -651,24 +751,108 @@ def _ensure_db():
     if not getattr(app, "_db_inited", False):
         with app.app_context():
             db.create_all()
-            # Create helpful indexes for speed
+            # MIGRATION NOTE: if your DB already exists, run these manually once (via SQLite shell or one-off route)
             try:
                 db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_booking_status ON booking_request(status);"))
                 db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_tx_created_at ON data_transaction(created_at);"))
                 db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_hist_booking ON booking_request_history(booking_request_id);"))
+                db.session.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_member_email ON member(email);"))
                 db.session.commit()
             except Exception as e:
                 print(f"[INDEX WARN] {e!r}")
         app._db_inited = True
 
 # -----------------------------
-# Routes
+# Routes — Accounts
+# -----------------------------
+@app.route("/signup", methods=["GET", "POST"])
+def signup():
+    if current_member():
+        return redirect(url_for("my_requests"))
+    form = SignupForm()
+    if form.validate_on_submit():
+        email = form.email.data.strip().lower()
+        existing = Member.query.filter(Member.email.ilike(email)).first()
+        if existing and existing.password_hash:
+            flash("An account with that email already exists. Please sign in.", "warning")
+            return redirect(url_for("signin"))
+
+        if existing and not existing.password_hash:
+            m = existing
+            m.name = form.name.data.strip()
+            m.phone = form.phone.data.strip() if form.phone.data else m.phone
+            m.password_hash = generate_password_hash(form.password.data)
+        else:
+            m = Member(
+                name=form.name.data.strip(),
+                email=email,
+                phone=form.phone.data.strip() if form.phone.data else None,
+                member_type="non_due",
+                password_hash=generate_password_hash(form.password.data),
+            )
+            db.session.add(m)
+
+        db.session.commit()
+        login_member(m)
+        flash("Account created. Welcome!", "success")
+        return redirect(url_for("my_requests"))
+    return render_template("auth_signup.html", form=form)
+
+@app.route("/signin", methods=["GET", "POST"])
+def signin():
+    if current_member():
+        return redirect(url_for("my_requests"))
+    form = SigninForm()
+    if form.validate_on_submit():
+        email = form.email.data.strip().lower()
+        m = Member.query.filter(Member.email.ilike(email)).first()
+        if not m or not m.password_hash or not check_password_hash(m.password_hash, form.password.data):
+            flash("Invalid email or password.", "danger")
+        else:
+            login_member(m)
+            flash("Signed in.", "success")
+            return redirect(url_for("my_requests"))
+    return render_template("auth_signin.html", form=form)
+
+@app.route("/signout")
+def signout():
+    logout_member()
+    flash("Signed out.", "info")
+    return redirect(url_for("home"))
+
+@app.route("/me/requests")
+def my_requests():
+    m = current_member()
+    if not m:
+        flash("Please sign in to view your requests.", "warning")
+        return redirect(url_for("signin"))
+    rows = (BookingRequest.query
+            .filter_by(member_id=m.id)
+            .order_by(BookingRequest.created_at.desc())
+            .all())
+    return render_template("my_requests.html", rows=rows)
+
+# -----------------------------
+# Routes — Core
 # -----------------------------
 @app.route("/", methods=["GET", "POST"])
 def home():
-    if (TEMPLATES_DIR / "home.html").exists():
-        form = RequestForm()
-        if form.validate_on_submit():
+    me = current_member()
+    form = RequestForm()
+
+    # Prefill contact fields if signed in
+    if request.method == "GET" and me:
+        form.name.data = me.name
+        form.email.data = me.email
+        form.phone.data = me.phone
+
+    if form.validate_on_submit():
+        # If logged in, always use that member record
+        if me:
+            member = me
+            member.name = form.name.data.strip()
+            member.phone = form.phone.data.strip() if form.phone.data else member.phone
+        else:
             member = Member.query.filter_by(email=form.email.data.strip()).first()
             if not member:
                 member = Member(
@@ -684,62 +868,53 @@ def home():
                 member.phone = form.phone.data.strip() if form.phone.data else member.phone
                 member.member_type = form.member_type.data
 
-            br = BookingRequest(
-                member_id=member.id,
-                start_date=form.start_date.data,
-                end_date=form.end_date.data,
-                notes=form.notes.data
-            )
-            db.session.add(br)
-            db.session.commit()
-            _snapshot_booking(br)  # snapshot initial "pending"
+        br = BookingRequest(
+            member_id=member.id,
+            start_date=form.start_date.data,
+            end_date=form.end_date.data,
+            notes=form.notes.data
+        )
+        db.session.add(br)
+        db.session.commit()
+        _snapshot_booking(br)  # snapshot initial "pending"
 
-            # DB conflict hint (non-blocking at request time)
-            conflicts = find_conflicts(br.start_date, br.end_date)
-            if conflicts:
-                flash("Heads up: those dates overlap with an approved booking. Admin will review.", "warning")
+        # DB conflicts (non-blocking at request time)
+        conflicts = find_conflicts(br.start_date, br.end_date)
+        if conflicts:
+            flash("Heads up: those dates overlap with an approved booking. Admin will review.", "warning")
 
-            # Google Calendar conflict hint (non-blocking at request time)
-            gc_conflicts = find_calendar_conflicts(br.start_date, br.end_date)
-            if gc_conflicts:
-                flash("Google Calendar shows overlapping events: " + "; ".join(gc_conflicts), "warning")
+        # Google Calendar conflicts (non-blocking at request time)
+        gc_conflicts = find_calendar_conflicts(br.start_date, br.end_date)
+        if gc_conflicts:
+            flash("Google Calendar shows overlapping events: " + "; ".join(gc_conflicts), "warning")
 
-            # notify admin + requester
-            admin_to = os.getenv("ADMIN_EMAIL", member.email)
-            ok_admin_email = send_email(
-                admin_to,
-                "New Lake House Booking Request",
-                f"{member.name} ({member.member_type}) requested {br.start_date} - {br.end_date}.\n"
-                f"Notes: {br.notes or '(none)'}\nReview: {request.url_root}admin/requests"
-            )
-            _tx("email", "success" if ok_admin_email else "error", booking=br, member=member, target=admin_to, meta={"subject": "New Lake House Booking Request"})
+        # notify admin + requester
+        admin_to = os.getenv("ADMIN_EMAIL", member.email)
+        ok_admin_email = send_email(
+            admin_to,
+            "New Lake House Booking Request",
+            f"{member.name} ({member.member_type}) requested {br.start_date} - {br.end_date}.\n"
+            f"Notes: {br.notes or '(none)'}\nReview: {request.url_root}admin/requests"
+        )
+        _tx("email", "success" if ok_admin_email else "error", booking=br, member=member, target=admin_to, meta={"subject": "New Lake House Booking Request"})
 
-            ok_user_email = send_email(
-                member.email,
-                "We received your lake house request",
-                f"Hi {member.name},\n\nWe received your request for {br.start_date} to {br.end_date}. "
-                "We'll notify you once it's approved or denied.\n\nThanks!"
-            )
-            _tx("email", "success" if ok_user_email else "error", booking=br, member=member, target=member.email, meta={"subject": "We received your lake house request"})
+        ok_user_email = send_email(
+            member.email,
+            "We received your lake house request",
+            f"Hi {member.name},\n\nWe received your request for {br.start_date} to {br.end_date}. "
+            "We'll notify you once it's approved or denied.\n\nThanks!"
+        )
+        _tx("email", "success" if ok_user_email else "error", booking=br, member=member, target=member.email, meta={"subject": "We received your lake house request"})
 
-            if form.subscribe_sms.data and member.phone:
-                ok_user_sms = send_sms(member.phone, f"Lake House: request received for {br.start_date} - {br.end_date}.")
-                _tx("sms", "success" if ok_user_sms else "error", booking=br, member=member, target=member.phone, meta={"preview": f"request received {br.start_date}→{br.end_date}"})
+        if form.subscribe_sms.data and member.phone:
+            ok_user_sms = send_sms(member.phone, f"Lake House: request received for {br.start_date} - {br.end_date}.")
+            _tx("sms", "success" if ok_user_sms else "error", booking=br, member=member, target=member.phone, meta={"preview": f"request received {br.start_date}→{br.end_date}"})
 
-            _log("create", br.id, f"Created by {member.email}")
-            flash("Request submitted! You'll receive an email confirmation.", "success")
-            return redirect(url_for("home"))
-        return render_template("home.html", form=form)
+        _log("create", br.id, f"Created by {member.email}")
+        flash("Request submitted! You'll receive an email confirmation.", "success")
+        return redirect(url_for("home"))
 
-    # fallback inline if template missing
-    return render_template_string("""
-      <!doctype html><html lang="en"><head><meta charset="utf-8"><title>Lake House</title></head>
-      <body>
-        <h1>Lake House Bookings</h1>
-        <p>✅ App is running, but <code>templates/home.html</code> is missing. Create it and redeploy.</p>
-        <p><a href="/_diag">Diagnostics</a></p>
-      </body></html>
-    """)
+    return render_template("home.html", form=form)
 
 # Friendly aliases to home
 @app.route("/index")
@@ -755,7 +930,6 @@ def favicon():
 # Calendar embed
 @app.route("/calendar")
 def calendar_view():
-    # Prefer a dedicated embed ID if you have one; else fall back to GOOGLE_CALENDAR_ID
     cal_id = os.getenv("GOOGLE_CALENDAR_EMBED_ID") or os.getenv("GOOGLE_CALENDAR_ID")
     embed_src = None
     if cal_id:
@@ -768,6 +942,9 @@ def calendar_view():
         )
     return render_template("calendar_embed.html", embed_src=embed_src, calendar_id=cal_id)
 
+# -----------------------------
+# Admin: auth + requests
+# -----------------------------
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
     form = AdminLoginForm()
@@ -810,7 +987,6 @@ def admin_logout():
     flash("Logged out.", "info")
     return redirect(url_for("home"))
 
-# Admin requests
 @app.route("/admin/requests")
 def admin_requests():
     if not is_admin():
@@ -825,6 +1001,13 @@ def admin_requests():
         .order_by(dues_first.asc(), BookingRequest.created_at.asc())
         .all()
     )
+
+    # Build Google Calendar conflict flags for pending (non-blocking)
+    pending_conflicts = {}
+    for r in pending:
+        gcs = find_calendar_conflicts(r.start_date, r.end_date)
+        if gcs:
+            pending_conflicts[r.id] = gcs
 
     approved = (
         db.session.query(BookingRequest)
@@ -842,26 +1025,16 @@ def admin_requests():
         .all()
     )
 
-    # Build a dict: booking_request_id -> list of human-readable conflicts from Google Calendar
-    # (find_calendar_conflicts() is already no-op if GCal isn't configured)
-    try:
-        gcal_conf = {r.id: find_calendar_conflicts(r.start_date, r.end_date) for r in pending}
-    except Exception as e:
-        app.logger.warning(f"[GCal conflicts] failed: {e!r}")
-        gcal_conf = {r.id: [] for r in pending}
-
     return render_template(
         "admin_requests.html",
         pending=pending,
         approved=approved,
         denied=denied,
-        gcal_conf=gcal_conf,  # <-- pass to template
+        pending_conflicts=pending_conflicts,
         logs=AuditLog.query.order_by(AuditLog.created_at.desc()).limit(50).all(),
     )
 
-
 # Actions
-# --- replace your existing approve_request with this exact version ---
 @app.post("/admin/requests/<int:req_id>/approve")
 def approve_request(req_id):
     if not is_admin():
@@ -872,20 +1045,14 @@ def approve_request(req_id):
     # 1) DB conflicts (approved bookings in SQLite)
     conflicts = find_conflicts(br.start_date, br.end_date, exclude_request_id=br.id)
     if conflicts:
-        conflict_list = ", ".join(
-            f"{c.member.name}({c.start_date}→{c.end_date})" for c in conflicts
-        )
+        conflict_list = ", ".join(f"{c.member.name}({c.start_date}→{c.end_date})" for c in conflicts)
         flash(f"Cannot approve: date conflict with {conflict_list}.", "danger")
         return redirect(url_for("admin_requests"))
 
     # 2) Google Calendar conflicts (existing events on the calendar)
     gc_conflicts = find_calendar_conflicts(br.start_date, br.end_date)
     if gc_conflicts:
-        flash(
-            "Cannot approve: Google Calendar already has overlapping event(s): "
-            + "; ".join(gc_conflicts),
-            "danger",
-        )
+        flash("Cannot approve: Google Calendar already has overlapping event(s): " + "; ".join(gc_conflicts), "danger")
         return redirect(url_for("admin_requests"))
 
     # 3) Approve & push to Google Calendar
@@ -897,6 +1064,7 @@ def approve_request(req_id):
         br.calendar_event_id = event_id
 
     db.session.commit()
+    _snapshot_booking(br)
     _notify_status(br)
     _log("approve", br.id, "Approved and synced to calendar")
     flash("Request approved and calendar updated.", "success")
@@ -944,7 +1112,9 @@ def cancel_request(req_id):
     flash("Request cancelled." + (" Calendar event removed." if ok_del else ""), "warning")
     return redirect(url_for("admin_requests"))
 
-# Public read-only ICS feed
+# -----------------------------
+# ICS feed
+# -----------------------------
 @app.route("/calendar.ics")
 def calendar_ics():
     events = (BookingRequest.query
@@ -988,7 +1158,9 @@ def calendar_ics():
     ics = "\r\n".join(lines + ["END:VCALENDAR"]) + "\r\n"  # CRLF per RFC5545
     return Response(ics, mimetype="text/calendar")
 
-# Diagnostics
+# -----------------------------
+# Diagnostics & utilities
+# -----------------------------
 @app.route("/_diag")
 def _diag():
     try:
@@ -1004,7 +1176,6 @@ def _diag():
     except Exception as e:
         return {"error": repr(e)}, 500
 
-# Route lister
 @app.route("/_routes")
 def _routes():
     rules = []
@@ -1013,7 +1184,6 @@ def _routes():
         rules.append({"rule": str(r), "endpoint": r.endpoint, "methods": methods})
     return jsonify(sorted(rules, key=lambda x: x["rule"]))
 
-# Admin diagnostics
 @app.route("/admin/_diag")
 def admin_diag():
     raw = os.getenv("ADMIN_EMAIL", "")
@@ -1094,9 +1264,7 @@ def export_requests_jsonl():
 def export_history_csv():
     if not is_admin():
         return redirect(url_for("admin_login"))
-    rows = (BookingRequestHistory.query
-            .order_by(BookingRequestHistory.at.desc())
-            .all())
+    rows = (BookingRequestHistory.query.order_by(BookingRequestHistory.at.desc()).all())
     f = StringIO()
     w = csv.writer(f)
     w.writerow(["id","at","booking_request_id","admin_email","status","start_date","end_date","calendar_event_id"])
@@ -1163,6 +1331,7 @@ def init_db():
         db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_booking_status ON booking_request(status);"))
         db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_tx_created_at ON data_transaction(created_at);"))
         db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_hist_booking ON booking_request_history(booking_request_id);"))
+        db.session.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_member_email ON member(email);"))
         db.session.commit()
     except Exception as e:
         print(f"[INDEX WARN] {e!r}")
