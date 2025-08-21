@@ -591,7 +591,6 @@ def find_calendar_conflicts(start_date: date, end_date: date):
     return conflicts
 # ---------------------------------------------------------------------
 
-
 # -----------------------------
 # Business rules & admin helpers
 # -----------------------------
@@ -695,9 +694,15 @@ def home():
             db.session.commit()
             _snapshot_booking(br)  # snapshot initial "pending"
 
+            # DB conflict hint (non-blocking at request time)
             conflicts = find_conflicts(br.start_date, br.end_date)
             if conflicts:
                 flash("Heads up: those dates overlap with an approved booking. Admin will review.", "warning")
+
+            # Google Calendar conflict hint (non-blocking at request time)
+            gc_conflicts = find_calendar_conflicts(br.start_date, br.end_date)
+            if gc_conflicts:
+                flash("Google Calendar shows overlapping events: " + "; ".join(gc_conflicts), "warning")
 
             # notify admin + requester
             admin_to = os.getenv("ADMIN_EMAIL", member.email)
@@ -762,32 +767,6 @@ def calendar_view():
             "&showPrint=0&showTitle=0"
         )
     return render_template("calendar_embed.html", embed_src=embed_src, calendar_id=cal_id)
-
-#@app.route("/calendar")
-#def calendar_view():
-    # Prefer a dedicated embed ID if you have one; else fall back to GOOGLE_CALENDAR_ID
-    #cal_id = os.getenv("GOOGLE_CALENDAR_EMBED_ID") or os.getenv("GOOGLE_CALENDAR_ID")
-    #embed_src = None
-    #if cal_id:
-       # embed_src = (
-           # "https://calendar.google.com/calendar/embed"
-          #  f"?src={quote(cal_id)}"
-           # "&ctz=America%2FNew_York"
-            #"&mode=MONTH"
-           # "&showPrint=0&showTitle=0"
-        #)
-   # return render_template("calendar_embed.html", embed_src=embed_src, calendar_id=cal_id)
-    
-# existing:
-conflicts = find_conflicts(br.start_date, br.end_date)
-if conflicts:
-    flash("Heads up: those dates overlap with an approved booking. Admin will review.", "warning")
-
-# NEW: Google Calendar conflict warning (non-blocking at request time)
-gc_conflicts = find_calendar_conflicts(br.start_date, br.end_date)
-if gc_conflicts:
-    flash("Google Calendar shows overlapping events: " + "; ".join(gc_conflicts), "warning")
-
 
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
