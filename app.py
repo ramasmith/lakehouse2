@@ -921,7 +921,12 @@ def account_login():
 def account_logout():
     session.pop("member_id", None)
     flash("Signed out.", "info")
-    return redirect(url_for("home"))
+    #return redirect(url_for("home"))
+# Redirect alias (for convenience)
+@app.route("/x")
+def x_alias():
+    return redirect(url_for("home"), code=302)
+
 
 @app.route("/account/requests")
 def account_requests():
