@@ -1,6 +1,8 @@
-# app.py — Lake House bookings (Render-safe, single-file, self-healing templates)
+# app.py — Lake House bookings (Render-safe, single-file, self-healing templates + history/exports)
 import os, sys
-import socket 
+import socket
+import json, csv
+from io import StringIO
 
 from pathlib import Path
 from datetime import datetime, date, timedelta
@@ -18,9 +20,9 @@ from wtforms import StringField, SelectField, DateField, TextAreaField, SubmitFi
 from wtforms.validators import DataRequired, Email, Length
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
-from sqlalchemy import case
+from sqlalchemy import case, text
 
-# Notifications
+# Notifications (SMTP)
 import smtplib
 from email.mime.text import MIMEText
 
@@ -46,7 +48,8 @@ TEMPLATES_DIR = BASE_DIR / "templates"
 
 app = Flask(__name__, template_folder=str(TEMPLATES_DIR))
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "dev-secret")
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///lakehouse.db"
+# Consider persistent disk on Render: sqlite:////var/data/lakehouse.db
+app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("SQLALCHEMY_DATABASE_URI", "sqlite:///lakehouse.db")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
@@ -79,6 +82,36 @@ class AuditLog(db.Model):
     admin_email = db.Column(db.String(255), nullable=True)
     details = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+# NEW: Side-effect logging (emails, sms, calendar operations)
+class DataTransaction(db.Model):
+    __tablename__ = "data_transaction"
+    id = db.Column(db.Integer, primary_key=True)
+    kind = db.Column(db.String(40), nullable=False)      # "email","sms","gcal.insert","gcal.delete"
+    status = db.Column(db.String(20), nullable=False)    # "success","error","skip"
+    booking_request_id = db.Column(db.Integer, db.ForeignKey('booking_request.id'))
+    member_id = db.Column(db.Integer, db.ForeignKey('member.id'))
+    target = db.Column(db.String(255))                   # email addr, phone, calendarId/eventId
+    meta_json = db.Column(db.Text)                       # JSON payload/response/error
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    booking_request = db.relationship("BookingRequest", lazy=True)
+    member = db.relationship("Member", lazy=True)
+
+# NEW: Snapshot of booking on each change (status, dates, notes)
+class BookingRequestHistory(db.Model):
+    __tablename__ = "booking_request_history"
+    id = db.Column(db.Integer, primary_key=True)
+    booking_request_id = db.Column(db.Integer, db.ForeignKey('booking_request.id'), nullable=False)
+    at = db.Column(db.DateTime, default=datetime.utcnow)
+    admin_email = db.Column(db.String(255))
+    status = db.Column(db.String(16), nullable=False)
+    start_date = db.Column(db.Date, nullable=False)
+    end_date = db.Column(db.Date, nullable=False)
+    notes = db.Column(db.Text)
+    calendar_event_id = db.Column(db.String(128))
+
+    booking_request = db.relationship("BookingRequest", lazy=True)
 
 # -----------------------------
 # Forms
@@ -294,7 +327,7 @@ _ensure_templates_present()
 # --- END SELF-HEALING TEMPLATES ---
 
 # -----------------------------
-# Helpers: Email, SMS, Calendar
+# Helpers: Email, SMS, Calendar, Logging
 # -----------------------------
 def send_email(to_email: str, subject: str, body: str) -> bool:
     """
@@ -343,11 +376,6 @@ def send_email(to_email: str, subject: str, body: str) -> bool:
         print(f"[EMAIL ERROR] {type(e).__name__}: {e}")
         return False
 
-try:
-    from twilio.rest import Client as TwilioClient
-except Exception:
-    TwilioClient = None
-
 def send_sms(to_number: str, body: str) -> bool:
     """
     Sends SMS via Twilio. Returns True on success.
@@ -378,6 +406,22 @@ def send_sms(to_number: str, body: str) -> bool:
     except Exception as e:
         print(f"[SMS ERROR] {e!r}")
         return False
+
+# Transaction logger (emails/sms/calendar)
+def _tx(kind, status, booking=None, member=None, target=None, meta=None):
+    try:
+        rec = DataTransaction(
+            kind=kind,
+            status=status,
+            booking_request_id=(booking.id if booking else None),
+            member_id=(member.id if member else None),
+            target=target,
+            meta_json=json.dumps(meta or {}, ensure_ascii=False),
+        )
+        db.session.add(rec)
+        db.session.commit()
+    except Exception as e:
+        print(f"[TX-LOG ERROR] {e!r}")
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
@@ -414,31 +458,39 @@ def add_event_to_calendar(summary, start_date, end_date, description=""):
     creds = _get_google_creds()
     if not creds:
         return None
-    service = build("calendar", "v3", credentials=creds)
-    event_body = {
-        "summary": summary,
-        "description": description,
-        "start": {"date": start_date.isoformat()},  # all-day
-        "end": {"date": (end_date + timedelta(days=1)).isoformat()},  # exclusive end
-    }
-    event = service.events().insert(calendarId=calendar_id, body=event_body).execute()
-    return event.get("id")
+    try:
+        service = build("calendar", "v3", credentials=creds)
+        event_body = {
+            "summary": summary,
+            "description": description,
+            "start": {"date": start_date.isoformat()},  # all-day
+            "end": {"date": (end_date + timedelta(days=1)).isoformat()},  # exclusive end
+        }
+        event = service.events().insert(calendarId=calendar_id, body=event_body).execute()
+        print(f"[Calendar] Inserted event id={event.get('id')}")
+        return event.get("id")
+    except Exception as e:
+        print(f"[Calendar] Insert failed: {e!r}")
+        return None
 
 def remove_event_from_calendar(event_id):
     calendar_id = os.getenv("GOOGLE_CALENDAR_ID")
     if not (calendar_id and event_id and GOOGLE_OK):
-        return
+        return False
     creds = _get_google_creds()
     if not creds:
-        return
-    service = build("calendar", "v3", credentials=creds)
+        return False
     try:
+        service = build("calendar", "v3", credentials=creds)
         service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
+        print(f"[Calendar] Deleted event id={event_id}")
+        return True
     except Exception as e:
         print(f"[Calendar] Failed to delete event: {e}")
+        return False
 
 # -----------------------------
-# Business rules
+# Business rules & admin helpers
 # -----------------------------
 def ranges_overlap(a_start, a_end, b_start, b_end):
     return not (a_end < b_start or b_end < a_start)
@@ -459,6 +511,22 @@ def _log(action, request_id, details=""):
     db.session.add(AuditLog(action=action, request_id=request_id, admin_email=current_admin_email(), details=details))
     db.session.commit()
 
+def _snapshot_booking(br: BookingRequest):
+    try:
+        snap = BookingRequestHistory(
+            booking_request_id=br.id,
+            admin_email=current_admin_email(),
+            status=br.status,
+            start_date=br.start_date,
+            end_date=br.end_date,
+            notes=br.notes,
+            calendar_event_id=br.calendar_event_id,
+        )
+        db.session.add(snap)
+        db.session.commit()
+    except Exception as e:
+        print(f"[HISTORY ERROR] {e!r}")
+
 def _notify_status(br: BookingRequest):
     member = br.member
     subj = f"Lake House request {br.status.upper()}: {br.start_date} - {br.end_date}"
@@ -467,18 +535,28 @@ def _notify_status(br: BookingRequest):
         body += "\nWe added it to the lake house calendar."
     elif br.status == "denied":
         body += "\nPlease contact the admin with any questions."
-    send_email(member.email, subj, body)
+    ok_email = send_email(member.email, subj, body)
+    _tx("email", "success" if ok_email else "error", booking=br, member=member, target=member.email, meta={"subject": subj})
     if member.phone:
-        send_sms(member.phone, f"Lake House: your request {br.status} for {br.start_date} - {br.end_date}.")
+        ok_sms = send_sms(member.phone, f"Lake House: your request {br.status} for {br.start_date} - {br.end_date}.")
+        _tx("sms", "success" if ok_sms else "error", booking=br, member=member, target=member.phone, meta={"preview": f"{br.status} {br.start_date}→{br.end_date}"})
 
 # -----------------------------
-# Ensure DB exists
+# Ensure DB exists + indexes (Render-safe)
 # -----------------------------
 @app.before_request
 def _ensure_db():
     if not getattr(app, "_db_inited", False):
         with app.app_context():
             db.create_all()
+            # Create helpful indexes for speed
+            try:
+                db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_booking_status ON booking_request(status);"))
+                db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_tx_created_at ON data_transaction(created_at);"))
+                db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_hist_booking ON booking_request_history(booking_request_id);"))
+                db.session.commit()
+            except Exception as e:
+                print(f"[INDEX WARN] {e!r}")
         app._db_inited = True
 
 # -----------------------------
@@ -512,26 +590,33 @@ def home():
             )
             db.session.add(br)
             db.session.commit()
+            _snapshot_booking(br)  # snapshot initial "pending"
 
             conflicts = find_conflicts(br.start_date, br.end_date)
             if conflicts:
                 flash("Heads up: those dates overlap with an approved booking. Admin will review.", "warning")
 
             # notify admin + requester
-            send_email(
-                os.getenv("ADMIN_EMAIL", member.email),
+            admin_to = os.getenv("ADMIN_EMAIL", member.email)
+            ok_admin_email = send_email(
+                admin_to,
                 "New Lake House Booking Request",
                 f"{member.name} ({member.member_type}) requested {br.start_date} - {br.end_date}.\n"
                 f"Notes: {br.notes or '(none)'}\nReview: {request.url_root}admin/requests"
             )
-            send_email(
+            _tx("email", "success" if ok_admin_email else "error", booking=br, member=member, target=admin_to, meta={"subject": "New Lake House Booking Request"})
+
+            ok_user_email = send_email(
                 member.email,
                 "We received your lake house request",
                 f"Hi {member.name},\n\nWe received your request for {br.start_date} to {br.end_date}. "
                 "We'll notify you once it's approved or denied.\n\nThanks!"
             )
+            _tx("email", "success" if ok_user_email else "error", booking=br, member=member, target=member.email, meta={"subject": "We received your lake house request"})
+
             if form.subscribe_sms.data and member.phone:
-                send_sms(member.phone, f"Lake House: request received for {br.start_date} - {br.end_date}.")
+                ok_user_sms = send_sms(member.phone, f"Lake House: request received for {br.start_date} - {br.end_date}.")
+                _tx("sms", "success" if ok_user_sms else "error", booking=br, member=member, target=member.phone, meta={"preview": f"request received {br.start_date}→{br.end_date}"})
 
             _log("create", br.id, f"Created by {member.email}")
             flash("Request submitted! You'll receive an email confirmation.", "success")
@@ -616,7 +701,7 @@ def admin_logout():
     flash("Logged out.", "info")
     return redirect(url_for("home"))
 
-# Admin requests — FIXED (balanced parentheses)
+# Admin requests
 @app.route("/admin/requests")
 def admin_requests():
     if not is_admin():
@@ -656,37 +741,6 @@ def admin_requests():
         logs=AuditLog.query.order_by(AuditLog.created_at.desc()).limit(50).all(),
     )
 
-# Admin diagnostics
-@app.route("/admin/_diag")
-def admin_diag():
-    raw = os.getenv("ADMIN_EMAIL", "")
-    masked = (raw[:2] + "***" + raw[-2:]) if len(raw) >= 5 else ("***" if raw else "")
-    return {
-        "has_secret_key": bool(app.config.get("SECRET_KEY")),
-        "has_admin_email": bool(os.getenv("ADMIN_EMAIL")),
-        "admin_email_masked": masked,
-        "has_admin_password": bool(os.getenv("ADMIN_PASSWORD")),
-    }, 200
-
-# Files diag
-@app.route("/_ls")
-def _ls():
-    tree = []
-    for root, dirs, files in os.walk(".", topdown=True):
-        if "/.venv" in root or "/site-packages" in root:
-            continue
-        tree.append({"root": root, "dirs": sorted(dirs), "files": sorted(files)})
-    return {"cwd": os.getcwd(), "tree": tree}, 200
-
-# Route lister
-@app.route("/_routes")
-def _routes():
-    rules = []
-    for r in app.url_map.iter_rules():
-        methods = ",".join(sorted(m for m in r.methods if m not in ("HEAD","OPTIONS")))
-        rules.append({"rule": str(r), "endpoint": r.endpoint, "methods": methods})
-    return jsonify(sorted(rules, key=lambda x: x["rule"]))
-
 # Actions
 @app.post("/admin/requests/<int:req_id>/approve")
 def approve_request(req_id):
@@ -705,9 +759,16 @@ def approve_request(req_id):
     if event_id:
         br.calendar_event_id = event_id
     db.session.commit()
+    _snapshot_booking(br)
+
+    _tx("gcal.insert", "success" if event_id else "error",
+        booking=br, member=br.member,
+        target=os.getenv("GOOGLE_CALENDAR_ID"),
+        meta={"event_id": event_id, "summary": summary})
+
     _notify_status(br)
-    _log("approve", br.id, "Approved and synced to calendar")
-    flash("Request approved and calendar updated.", "success")
+    _log("approve", br.id, "Approved and attempted calendar sync")
+    flash("Request approved." + (" Calendar updated." if event_id else " Calendar sync skipped/failed."), "success" if event_id else "warning")
     return redirect(url_for("admin_requests"))
 
 @app.post("/admin/requests/<int:req_id>/deny")
@@ -716,13 +777,19 @@ def deny_request(req_id):
         return redirect(url_for("admin_login"))
     br = BookingRequest.query.get_or_404(req_id)
     br.status = "denied"
+    ok_del = False
     if br.calendar_event_id:
-        remove_event_from_calendar(br.calendar_event_id)
+        ok_del = remove_event_from_calendar(br.calendar_event_id)
+        _tx("gcal.delete", "success" if ok_del else "error",
+            booking=br, member=br.member,
+            target=os.getenv("GOOGLE_CALENDAR_ID"),
+            meta={"event_id": br.calendar_event_id})
         br.calendar_event_id = None
     db.session.commit()
+    _snapshot_booking(br)
     _notify_status(br)
     _log("deny", br.id, "Denied by admin")
-    flash("Request denied.", "info")
+    flash("Request denied." + (" Calendar event removed." if ok_del else ""), "info")
     return redirect(url_for("admin_requests"))
 
 @app.post("/admin/requests/<int:req_id>/cancel")
@@ -731,13 +798,19 @@ def cancel_request(req_id):
         return redirect(url_for("admin_login"))
     br = BookingRequest.query.get_or_404(req_id)
     br.status = "cancelled"
+    ok_del = False
     if br.calendar_event_id:
-        remove_event_from_calendar(br.calendar_event_id)
+        ok_del = remove_event_from_calendar(br.calendar_event_id)
+        _tx("gcal.delete", "success" if ok_del else "error",
+            booking=br, member=br.member,
+            target=os.getenv("GOOGLE_CALENDAR_ID"),
+            meta={"event_id": br.calendar_event_id})
         br.calendar_event_id = None
     db.session.commit()
+    _snapshot_booking(br)
     _notify_status(br)
     _log("cancel", br.id, "Cancelled by admin")
-    flash("Request cancelled and calendar updated.", "warning")
+    flash("Request cancelled." + (" Calendar event removed." if ok_del else ""), "warning")
     return redirect(url_for("admin_requests"))
 
 # Public read-only ICS feed
@@ -784,6 +857,128 @@ def calendar_ics():
     ics = "\r\n".join(lines + ["END:VCALENDAR"]) + "\r\n"  # CRLF per RFC5545
     return Response(ics, mimetype="text/calendar")
 
+# Diagnostics
+@app.route("/_diag")
+def _diag():
+    try:
+        return jsonify({
+            "cwd": os.getcwd(),
+            "python_version": sys.version,
+            "base_dir": str(BASE_DIR),
+            "template_dir": str(TEMPLATES_DIR),
+            "has_templates_dir": TEMPLATES_DIR.is_dir(),
+            "templates_list": sorted(p.name for p in TEMPLATES_DIR.glob("*")) if TEMPLATES_DIR.is_dir() else [],
+            "files_in_cwd": sorted(os.listdir(".")),
+        })
+    except Exception as e:
+        return {"error": repr(e)}, 500
+
+# Route lister
+@app.route("/_routes")
+def _routes():
+    rules = []
+    for r in app.url_map.iter_rules():
+        methods = ",".join(sorted(m for m in r.methods if m not in ("HEAD","OPTIONS")))
+        rules.append({"rule": str(r), "endpoint": r.endpoint, "methods": methods})
+    return jsonify(sorted(rules, key=lambda x: x["rule"]))
+
+# Admin diagnostics
+@app.route("/admin/_diag")
+def admin_diag():
+    raw = os.getenv("ADMIN_EMAIL", "")
+    masked = (raw[:2] + "***" + raw[-2:]) if len(raw) >= 5 else ("***" if raw else "")
+    return {
+        "has_secret_key": bool(app.config.get("SECRET_KEY")),
+        "has_admin_email": bool(os.getenv("ADMIN_EMAIL")),
+        "admin_email_masked": masked,
+        "has_admin_password": bool(os.getenv("ADMIN_PASSWORD")),
+    }, 200
+
+# Email/SMS test endpoints (admin only)
+@app.route("/admin/_emailtest")
+def _emailtest():
+    if not is_admin():
+        return redirect(url_for("admin_login"))
+    to = request.args.get("to") or os.getenv("ADMIN_EMAIL")
+    if not to:
+        return jsonify({"ok": False, "error": "Provide ?to=someone@example.com or set ADMIN_EMAIL"}), 400
+    ok = send_email(to, "Lakehouse test email", "This is a test email from the Lakehouse app.")
+    _tx("email", "success" if ok else "error", target=to, meta={"subject": "Lakehouse test email"})
+    return jsonify({"ok": ok})
+
+@app.route("/admin/_smstest")
+def _smstest():
+    if not is_admin():
+        return redirect(url_for("admin_login"))
+    to = request.args.get("to")  # Must be E.164 like +15551234567
+    if not to:
+        return jsonify({"ok": False, "error": "Provide ?to=+1XXXXXXXXXX"}), 400
+    ok = send_sms(to, "Lakehouse test SMS: hello from the app.")
+    _tx("sms", "success" if ok else "error", target=to, meta={"preview": "Lakehouse test SMS"})
+    return jsonify({"ok": ok})
+
+# Exports
+@app.route("/admin/exports/transactions.csv")
+def export_transactions_csv():
+    if not is_admin():
+        return redirect(url_for("admin_login"))
+    rows = DataTransaction.query.order_by(DataTransaction.created_at.desc()).all()
+    f = StringIO()
+    w = csv.writer(f)
+    w.writerow(["id","created_at","kind","status","booking_request_id","member_id","target","meta_json"])
+    for r in rows:
+        w.writerow([r.id, r.created_at.isoformat(), r.kind, r.status,
+                    r.booking_request_id, r.member_id, r.target, r.meta_json or "{}"])
+    return Response(
+        f.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition":"attachment; filename=transactions.csv"}
+    )
+
+@app.route("/admin/exports/requests.jsonl")
+def export_requests_jsonl():
+    if not is_admin():
+        return redirect(url_for("admin_login"))
+    rows = BookingRequest.query.order_by(BookingRequest.created_at.desc()).all()
+    out = []
+    for r in rows:
+        out.append({
+            "id": r.id,
+            "member": {
+                "id": r.member.id,
+                "name": r.member.name,
+                "email": r.member.email,
+                "type": r.member.member_type,
+            },
+            "start_date": r.start_date.isoformat(),
+            "end_date": r.end_date.isoformat(),
+            "status": r.status,
+            "calendar_event_id": r.calendar_event_id,
+            "created_at": r.created_at.isoformat(),
+            "notes": r.notes,
+        })
+    return jsonify(out)
+
+@app.route("/admin/exports/history.csv")
+def export_history_csv():
+    if not is_admin():
+        return redirect(url_for("admin_login"))
+    rows = (BookingRequestHistory.query
+            .order_by(BookingRequestHistory.at.desc())
+            .all())
+    f = StringIO()
+    w = csv.writer(f)
+    w.writerow(["id","at","booking_request_id","admin_email","status","start_date","end_date","calendar_event_id"])
+    for r in rows:
+        w.writerow([r.id, r.at.isoformat(), r.booking_request_id, r.admin_email or "",
+                    r.status, r.start_date.isoformat(), r.end_date.isoformat(),
+                    r.calendar_event_id or ""])
+    return Response(
+        f.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition":"attachment; filename=booking_history.csv"}
+    )
+
 # Friendly 404 with links
 @app.errorhandler(404)
 def not_found(e):
@@ -805,42 +1000,6 @@ def not_found(e):
     """
     return make_response(html, 404)
 
-@app.route("/admin/_emailtest")
-def _emailtest():
-    if not is_admin():
-        return redirect(url_for("admin_login"))
-    to = request.args.get("to") or os.getenv("ADMIN_EMAIL")
-    if not to:
-        return jsonify({"ok": False, "error": "Provide ?to=someone@example.com or set ADMIN_EMAIL"}), 400
-    ok = send_email(to, "Lakehouse test email", "This is a test email from the Lakehouse app.")
-    return jsonify({"ok": ok})
-
-@app.route("/admin/_smstest")
-def _smstest():
-    if not is_admin():
-        return redirect(url_for("admin_login"))
-    to = request.args.get("to")  # Must be E.164 like +15551234567
-    if not to:
-        return jsonify({"ok": False, "error": "Provide ?to=+1XXXXXXXXXX"}), 400
-    ok = send_sms(to, "Lakehouse test SMS: hello from the app.")
-    return jsonify({"ok": ok})
-
-# Diagnostics
-@app.route("/_diag")
-def _diag():
-    try:
-        return jsonify({
-            "cwd": os.getcwd(),
-            "python_version": sys.version,
-            "base_dir": str(BASE_DIR),
-            "template_dir": str(TEMPLATES_DIR),
-            "has_templates_dir": TEMPLATES_DIR.is_dir(),
-            "templates_list": sorted(p.name for p in TEMPLATES_DIR.glob("*")) if TEMPLATES_DIR.is_dir() else [],
-            "files_in_cwd": sorted(os.listdir(".")),
-        })
-    except Exception as e:
-        return {"error": repr(e)}, 500
-
 # Reminders (opt-in: set ENABLE_SCHEDULER=1)
 def send_upcoming_reminders():
     today = date.today()
@@ -850,13 +1009,15 @@ def send_upcoming_reminders():
         BookingRequest.start_date == in_two_days
     ).all()
     for br in upcoming:
-        send_email(
+        ok_email = send_email(
             br.member.email,
             "Lake House reminder",
             f"Hi {br.member.name}, your lake house stay starts on {br.start_date}. Enjoy!"
         )
+        _tx("email", "success" if ok_email else "error", booking=br, member=br.member, target=br.member.email, meta={"subject": "Lake House reminder"})
         if br.member.phone:
-            send_sms(br.member.phone, f"Reminder: your lake house stay starts on {br.start_date}.")
+            ok_sms = send_sms(br.member.phone, f"Reminder: your lake house stay starts on {br.start_date}.")
+            _tx("sms", "success" if ok_sms else "error", booking=br, member=br.member, target=br.member.phone, meta={"preview": "stay starts soon"})
 
 if os.getenv("ENABLE_SCHEDULER", "0") == "1":
     scheduler = BackgroundScheduler(daemon=True)
@@ -866,6 +1027,14 @@ if os.getenv("ENABLE_SCHEDULER", "0") == "1":
 @app.cli.command("init-db")
 def init_db():
     db.create_all()
+    # Also create indexes if running locally via CLI
+    try:
+        db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_booking_status ON booking_request(status);"))
+        db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_tx_created_at ON data_transaction(created_at);"))
+        db.session.execute(text("CREATE INDEX IF NOT EXISTS idx_hist_booking ON booking_request_history(booking_request_id);"))
+        db.session.commit()
+    except Exception as e:
+        print(f"[INDEX WARN] {e!r}")
     print("Database initialized.")
 
 if __name__ == "__main__":
