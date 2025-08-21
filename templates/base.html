@@ -27,16 +27,28 @@
     <nav>
       <ul><li><strong>Lake House Bookings</strong></li></ul>
       <ul>
-        <li><a href="{{ url_for('home') }}">Request</a></li>
-        <li><a href="{{ url_for('admin_requests') }}">Admin View</a></li>
-        <li><a href="{{ url_for('calendar_ics') }}">ICS feed</a></li>
-        {% if session.get('is_admin') %}
-          <li><a href="{{ url_for('admin_logout') }}">Logout</a></li>
-        {% else %}
-          <li><a href="{{ url_for('admin_login') }}">Admin Login</a></li>
-        {% endif %}
-        <li><a href="{{ url_for('calendar_view') }}">Calendar</a></li>
-      </ul>
+  <li><a href="{{ url_for('home') }}">Request</a></li>
+  <li><a href="{{ url_for('calendar_view') }}">Calendar</a></li>
+  <li><a href="{{ url_for('calendar_ics') }}">ICS feed</a></li>
+
+  {# Member section #}
+  {% if session.get('member_id') %}
+    <li><a href="{{ url_for('account_requests') }}">My requests</a></li>
+    <li><a href="{{ url_for('account_logout') }}">Sign out</a></li>
+  {% else %}
+    <li><a href="{{ url_for('account_login') }}">Sign in</a></li>
+    <li><a href="{{ url_for('account_register') }}">Register</a></li>
+  {% endif %}
+
+  {# Admin section #}
+  {% if session.get('is_admin') %}
+    <li><a href="{{ url_for('admin_requests') }}">Admin</a></li>
+    <li><a href="{{ url_for('admin_logout') }}">Admin logout</a></li>
+  {% else %}
+    <li><a href="{{ url_for('admin_login') }}">Admin</a></li>
+  {% endif %}
+</ul>
+
     </nav>
 
     {% with messages = get_flashed_messages(with_categories=true) %}
