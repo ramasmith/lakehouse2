@@ -747,6 +747,7 @@ def index_alias():
 def favicon():
     return ("", 204)
 
+# Calendar embed
 @app.route("/calendar")
 def calendar_view():
     # Prefer a dedicated embed ID if you have one; else fall back to GOOGLE_CALENDAR_ID
@@ -761,6 +762,21 @@ def calendar_view():
             "&showPrint=0&showTitle=0"
         )
     return render_template("calendar_embed.html", embed_src=embed_src, calendar_id=cal_id)
+
+#@app.route("/calendar")
+#def calendar_view():
+    # Prefer a dedicated embed ID if you have one; else fall back to GOOGLE_CALENDAR_ID
+    #cal_id = os.getenv("GOOGLE_CALENDAR_EMBED_ID") or os.getenv("GOOGLE_CALENDAR_ID")
+    #embed_src = None
+    #if cal_id:
+       # embed_src = (
+           # "https://calendar.google.com/calendar/embed"
+          #  f"?src={quote(cal_id)}"
+           # "&ctz=America%2FNew_York"
+            #"&mode=MONTH"
+           # "&showPrint=0&showTitle=0"
+        #)
+   # return render_template("calendar_embed.html", embed_src=embed_src, calendar_id=cal_id)
     
 # existing:
 conflicts = find_conflicts(br.start_date, br.end_date)
