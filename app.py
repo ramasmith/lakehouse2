@@ -174,6 +174,60 @@ class SigninForm(FlaskForm):
     
 
 # --- SELF-HEALING TEMPLATES ---
+DEFAULT_TEMPLATES.update({
+    "member_login.html": """{% extends "base.html" %}
+{% block content %}
+<h2>Sign in</h2>
+<form method="POST">
+  {{ form.hidden_tag() }}
+  <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
+  <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
+  <button type="submit">Sign in</button>
+</form>
+<p>No account? <a href="{{ url_for('account_register') }}">Register</a>.</p>
+{% endblock %}""",
+
+    "member_register.html": """{% extends "base.html" %}
+{% block content %}
+<h2>Create an account</h2>
+<form method="POST">
+  {{ form.hidden_tag() }}
+  <div class="grid">
+    <label>{{ form.name.label }} {{ form.name(size=32) }}</label>
+    <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
+    <label>{{ form.phone.label }} {{ form.phone(size=20) }}</label>
+    <label>{{ form.member_type.label }} {{ form.member_type() }}</label>
+    <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
+  </div>
+  <button type="submit">Create account</button>
+</form>
+<p>Already have an account? <a href="{{ url_for('account_login') }}">Sign in</a>.</p>
+{% endblock %}""",
+
+    "member_requests.html": """{% extends "base.html" %}
+{% block content %}
+<h2>My requests</h2>
+<p><strong>{{ me.name }}</strong> &lt;{{ me.email }}&gt;</p>
+{% if requests %}
+<table role="grid">
+  <thead><tr><th>Dates</th><th>Status</th><th>Notes</th><th>Created</th></tr></thead>
+  <tbody>
+  {% for r in requests %}
+    <tr>
+      <td>{{ r.start_date }} → {{ r.end_date }}</td>
+      <td>{{ r.status }}</td>
+      <td>{{ r.notes or "" }}</td>
+      <td>{{ r.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No requests yet. <a href="{{ url_for('home') }}">Make one</a>.</p>
+{% endif %}
+{% endblock %}""",
+})
+
 DEFAULT_TEMPLATES = {
     "base.html": """<!doctype html>
 <html lang="en"><head>
