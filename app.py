@@ -1004,6 +1004,11 @@ def request_new():
 
     return render_template("request_form.html", form=form, unavailable_dates=unavailable_dates)
 
+# Backward-compat alias for old templates/links
+@app.route("/request-booking")
+def request_booking():  # old name used in templates
+    return redirect(url_for("request_new"), code=302)
+
 # =========================
 # Calendar & Admin
 # =========================
