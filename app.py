@@ -924,11 +924,26 @@ def home():
     me = current_member()
     form = RequestForm()
 
+    # Prefill if member is signed in
+    if session.get("member_id"):
+        me = Member.query.get(session["member_id"])
+    if me:
+        form.name.data = me.name
+        form.email.data = me.email
+        form.phone.data = me.phone
+        form.member_type.data = me.member_type
+
     # Prefill contact fields if signed in
     if request.method == "GET" and me:
         form.name.data = me.name
         form.email.data = me.email
         form.phone.data = me.phone
+
+member = None
+if session.get("member_id"):
+    member = Member.query.get(session["member_id"])
+if not member:
+    member = Member.query.filter_by(email=form.email.data.strip()).first()
 
     if form.validate_on_submit():
         # If logged in, always use that member record
