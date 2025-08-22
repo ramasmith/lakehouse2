@@ -1,4 +1,4 @@
-# app.py — Lake House bookings (Render-safe, self-healing templates, date blocking w/ end-day overlap allowed)
+# app.py — Lake House bookings (Flatpickr calendar fixed, sign-out visible, end-day overlap allowed)
 import os, sys, json, csv, socket
 from io import StringIO
 from pathlib import Path
@@ -74,7 +74,7 @@ class BookingRequest(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     member_id = db.Column(db.Integer, db.ForeignKey('member.id'), nullable=False)
     start_date = db.Column(db.Date, nullable=False)
-    end_date = db.Column(db.Date, nullable=False)  # stored as inclusive, but we TREAT as end-exclusive in logic
+    end_date = db.Column(db.Date, nullable=False)  # stored as inclusive, but we TREAT end-day as exclusive in logic
     notes = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     status = db.Column(db.String(16), nullable=False, default="pending")  # pending/approved/denied/cancelled
@@ -131,6 +131,7 @@ class RequestForm(FlaskForm):
         ("due", "Due-paying member"),
         ("non_due", "Non due-paying member")
     ], validators=[DataRequired()])
+    # We'll force these to text inputs in the template so Flatpickr renders
     start_date = DateField("Start Date", validators=[DataRequired()], format="%Y-%m-%d")
     end_date = DateField("End Date", validators=[DataRequired()], format="%Y-%m-%d")
     notes = TextAreaField("Notes (optional)")
@@ -158,10 +159,12 @@ class SignupForm(FlaskForm):
     submit = SubmitField("Create account")
 
 # -----------------------------
-# Self-healing templates (Flatpickr + summer lake vibe)
+# Self-healing templates (Flatpickr + modern summer lake vibe)
 # -----------------------------
 DEFAULT_TEMPLATES = {
-    "base.html": r"""<!doctype html>
+    # include a version marker so we can detect/refresh if needed
+    "base.html": r"""<!-- LAKEHOUSE_BASE_V3 -->
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -203,10 +206,10 @@ DEFAULT_TEMPLATES = {
         {% if session.get('user_member_id') %}
           <li><a href="{{ url_for('dashboard') }}">Dashboard</a></li>
           <li><a href="{{ url_for('request_booking') }}">New request</a></li>
-          <li><a href="{{ url_for('logout') }}">Sign out</a></li>
+          <li><a href="{{ url_for('signout') }}">Sign out</a></li>
         {% else %}
-          <li><a href="{{ url_for('login') }}">Sign in</a></li>
-          <li><a href="{{ url_for('register') }}">Create account</a></li>
+          <li><a href="{{ url_for('signin') }}">Sign in</a></li>
+          <li><a href="{{ url_for('signup') }}">Create account</a></li>
         {% endif %}
         {% if session.get('is_admin') %}
           <li><a href="{{ url_for('admin_requests') }}">Admin</a></li>
@@ -234,17 +237,18 @@ DEFAULT_TEMPLATES = {
     </footer>
   </main>
 
+  <!-- Flatpickr -->
   <script src="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.js"></script>
   <script>
-    // Global datepicker initializer
+    // Calendar initializer — blocks interior booked days, allows end-day overlap
     async function initLakeDatepickers() {
       const pickers = document.querySelectorAll("input.datepicker");
       if (!pickers.length) return;
 
       let blocked = [];
       try {
-        const res = await fetch("{{ url_for('api_booked_dates') }}");
-        blocked = await res.json(); // list of YYYY-MM-DD strings
+        const res = await fetch("{{ url_for('api_booked_dates') }}", {cache:"no-store"});
+        blocked = await res.json();
       } catch (e) {
         console.warn("Failed to load blocked dates", e);
       }
@@ -255,7 +259,7 @@ DEFAULT_TEMPLATES = {
         return blockedSet.has(iso);
       }
 
-      function onChangeCheck(selDates, dateStr, instance){
+      function onChangeCheck(selDates, _dateStr, instance){
         if (!selDates.length) return;
         const iso = selDates[0].toISOString().slice(0,10);
         if (blockedSet.has(iso)) {
@@ -274,6 +278,7 @@ DEFAULT_TEMPLATES = {
       pickers.forEach(el => {
         // Ensure text type for Flatpickr (avoid native datepicker override)
         el.setAttribute("type","text");
+        // In case of server-side render, default or restore value is respected
         el._fp = flatpickr(el, opts);
       });
 
@@ -298,16 +303,15 @@ DEFAULT_TEMPLATES = {
         form.addEventListener("submit", (evt) => {
           const sv = s && s.value ? new Date(s.value) : null;
           const ev = e && e.value ? new Date(e.value) : null;
-          if (!sv || !ev) return; // let server validate too
+          if (!sv || !ev) return; // server will also validate
           if (ev <= sv) {
             alert("End date must be AFTER start date.");
             evt.preventDefault();
             return;
           }
-          // iterate [start, end) -> no blocking on the end day
           let cur = new Date(s.value);
           const end = new Date(e.value);
-          while (cur < end) {
+          while (cur < end) { // end-exclusive
             const iso = cur.toISOString().slice(0,10);
             if (blockedSet.has(iso)) {
               alert("Your selection overlaps with an already booked date (" + iso + "). Please choose different dates.");
@@ -330,8 +334,8 @@ DEFAULT_TEMPLATES = {
   <h2>Welcome to the Lake House</h2>
   <p>Sign in to see your bookings, or create a new request.</p>
   <div class="grid">
-    <a class="btn-primary" href="{{ url_for('login') }}">Sign in</a>
-    <a class="secondary" href="{{ url_for('register') }}">Create account</a>
+    <a class="btn-primary" href="{{ url_for('signin') }}">Sign in</a>
+    <a class="secondary" href="{{ url_for('signup') }}">Create account</a>
   </div>
 </section>
 {% endblock %}""",
@@ -345,7 +349,7 @@ DEFAULT_TEMPLATES = {
   <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
   <button class="btn-primary" type="submit">Sign in</button>
 </form>
-<p>No account? <a href="{{ url_for('register') }}">Create one</a></p>
+<p>No account? <a href="{{ url_for('signup') }}">Create one</a></p>
 {% endblock %}""",
 
     "auth_signup.html": r"""{% extends "base.html" %}
@@ -359,7 +363,7 @@ DEFAULT_TEMPLATES = {
   <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
   <button class="btn-primary" type="submit">Create account</button>
 </form>
-<p>Already have an account? <a href="{{ url_for('login') }}">Sign in</a></p>
+<p>Already have an account? <a href="{{ url_for('signin') }}">Sign in</a></p>
 {% endblock %}""",
 
     "dashboard.html": r"""{% extends "base.html" %}
@@ -411,8 +415,9 @@ DEFAULT_TEMPLATES = {
     <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
     <label>{{ form.phone.label }} {{ form.phone(size=20) }}</label>
     <label>{{ form.member_type.label }} {{ form.member_type() }}</label>
-    <label>{{ form.start_date.label }} {{ form.start_date(class_="datepicker", type="text") }}</label>
-    <label>{{ form.end_date.label }} {{ form.end_date(class_="datepicker", type="text") }}</label>
+    <!-- Force type='text' + class for Flatpickr -->
+    <label>{{ form.start_date.label }} {{ form.start_date(class_="datepicker", type="text", placeholder="YYYY-MM-DD") }}</label>
+    <label>{{ form.end_date.label }} {{ form.end_date(class_="datepicker", type="text", placeholder="YYYY-MM-DD") }}</label>
   </div>
   <label>{{ form.notes.label }} {{ form.notes(rows=3) }}</label>
   <label>{{ form.subscribe_sms() }} {{ form.subscribe_sms.label }}</label>
@@ -444,12 +449,8 @@ DEFAULT_TEMPLATES = {
       <td>{{ r.start_date }} → {{ r.end_date }}</td>
       <td>{{ r.notes }}</td>
       <td>
-        <form method="POST" action="{{ url_for('approve_request', req_id=r.id) }}" style="display:inline;">
-          <button>Approve</button>
-        </form>
-        <form method="POST" action="{{ url_for('deny_request', req_id=r.id) }}" style="display:inline;">
-          <button class="secondary">Deny</button>
-        </form>
+        <form method="POST" action="{{ url_for('approve_request', req_id=r.id) }}" style="display:inline;"><button>Approve</button></form>
+        <form method="POST" action="{{ url_for('deny_request', req_id=r.id) }}" style="display:inline;"><button class="secondary">Deny</button></form>
       </td>
     </tr>
   {% endfor %}
@@ -470,12 +471,8 @@ DEFAULT_TEMPLATES = {
       <td>{{ r.start_date }} → {{ r.end_date }}</td>
       <td>{% if r.calendar_event_id %}<code>{{ r.calendar_event_id }}</code>{% else %}-{% endif %}</td>
       <td>
-        <form method="POST" action="{{ url_for('deny_request', req_id=r.id) }}" style="display:inline;">
-          <button class="secondary">Revoke</button>
-        </form>
-        <form method="POST" action="{{ url_for('cancel_request', req_id=r.id) }}" style="display:inline;">
-          <button class="contrast">Cancel</button>
-        </form>
+        <form method="POST" action="{{ url_for('deny_request', req_id=r.id) }}" style="display:inline;"><button class="secondary">Revoke</button></form>
+        <form method="POST" action="{{ url_for('cancel_request', req_id=r.id) }}" style="display:inline;"><button class="contrast">Cancel</button></form>
       </td>
     </tr>
   {% endfor %}
@@ -502,13 +499,18 @@ DEFAULT_TEMPLATES = {
 }
 
 def _ensure_templates_present():
+    """
+    Write templates if missing; optionally force refresh with FORCE_TEMPLATE_REFRESH=1
+    or if the version marker is missing.
+    """
     try:
         TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+        force = os.getenv("FORCE_TEMPLATE_REFRESH", "0") == "1"
         for name, content in DEFAULT_TEMPLATES.items():
             p = TEMPLATES_DIR / name
-            if not p.exists():
+            if force or (not p.exists()) or ("LAKEHOUSE_BASE_V3" in content and "LAKEHOUSE_BASE_V3" not in (p.read_text(encoding="utf-8") if p.exists() else "")):
                 p.write_text(content, encoding="utf-8")
-                app.logger.info(f"[bootstrap] wrote missing template: {p}")
+                app.logger.info(f"[bootstrap] wrote template: {p}")
     except Exception as e:
         app.logger.error(f"[bootstrap] failed creating templates: {e}")
 
@@ -684,8 +686,6 @@ def ranges_overlap(a_start, a_end, b_start, b_end):
     """
     Treat end days as EXCLUSIVE so back-to-back bookings are allowed:
     [a_start, a_end) overlaps [b_start, b_end)  <=>  not (a_end <= b_start or b_end <= a_start)
-    NOTE: we store end_date inclusive in DB, but we apply this logic directly to dates
-    so that equality at endpoints (a_end == b_start) is allowed (no overlap).
     """
     return not (a_end <= b_start or b_end <= a_start)
 
@@ -744,7 +744,7 @@ def _ensure_db():
         app._db_inited = True
 
 # -----------------------------
-# Public auth + aliases (includes logout)
+# Public auth + aliases (includes signout)
 # -----------------------------
 @app.route("/signup", methods=["GET", "POST"])
 def signup():
@@ -756,7 +756,7 @@ def signup():
         m = Member.query.filter(Member.email == email).first()
         if m and m.password_hash:
             flash("An account with that email already exists. Please sign in.", "warning")
-            return redirect(url_for("login"))
+            return redirect(url_for("signin"))
         if not m:
             m = Member(
                 name=form.name.data.strip(),
@@ -798,7 +798,7 @@ def signout():
     flash("Signed out.", "info")
     return redirect(url_for("root"))
 
-# Friendly aliases
+# Friendly short aliases
 @app.route("/login", methods=["GET", "POST"])
 def login():
     return signin()
@@ -892,6 +892,7 @@ def _request_form_handler():
         flash("Request submitted! You’ll receive an email confirmation.", "success")
         return redirect(url_for("dashboard") if current_member() else url_for("root"))
 
+    # IMPORTANT: ensure the rendered inputs are text + class=datepicker (see template)
     return render_template("request.html", form=form)
 
 @app.route("/request", methods=["GET", "POST"])
@@ -902,7 +903,7 @@ def request_booking():
 def request_new():
     return _request_form_handler()
 
-# Legacy aliases for older templates
+# Backward-compat aliases (in case templates link differently)
 @app.route("/request_booking", methods=["GET", "POST"])
 def request_booking_old():
     return _request_form_handler()
@@ -921,8 +922,7 @@ def api_booked_dates():
     blocked = set()
     for s, e in rows:
         d = s
-        # stop BEFORE e to allow back-to-back on the end day
-        while d < e:
+        while d < e:  # stop BEFORE e so end-day is free for back-to-back bookings
             blocked.add(d.isoformat())
             d += timedelta(days=1)
     return jsonify(sorted(blocked))
