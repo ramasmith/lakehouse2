@@ -1,4 +1,4 @@
-# app.py — Lake House bookings (Flatpickr-disabled dates + popup + server validation; self-healing templates)
+# app.py — Lake House bookings (Modern summer-lake styling + disabled dates + popup + server validation)
 import os, sys, socket, json, csv
 from io import StringIO
 from pathlib import Path
@@ -28,7 +28,7 @@ try:
 except Exception:
     GOOGLE_OK = False
 
-# Optional: SMTP / SMS
+# Optional: SMTP / SMS (email DRY-RUN by default)
 import smtplib
 from email.mime.text import MIMEText
 try:
@@ -108,7 +108,7 @@ class RequestForm(FlaskForm):
     member_type = SelectField("Membership Type",
         choices=[("due","Due-paying member"), ("non_due","Non due-paying member")],
         validators=[DataRequired()])
-    # IMPORTANT: text inputs so Flatpickr truly takes over
+    # Use text inputs so Flatpickr truly takes over
     start_date = StringField("Start Date", validators=[DataRequired()], render_kw={"autocomplete":"off"})
     end_date   = StringField("End Date",   validators=[DataRequired()], render_kw={"autocomplete":"off"})
     notes = TextAreaField("Notes (optional)")
@@ -116,125 +116,246 @@ class RequestForm(FlaskForm):
     submit = SubmitField("Submit Request")
 
 # --------------------------------
-# Self-healing templates
+# Self-healing templates with modern/summer-lake styling
 # --------------------------------
 DEFAULT_TEMPLATES = {
 "base.html": """<!doctype html>
-<html lang="en"><head>
+<html lang="en" data-theme="light"><head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Lake House Bookings</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Catamaran:wght@700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
   <style>
-    .badge { padding: 0.2rem 0.4rem; border-radius: 4px; font-size: 0.75rem; }
-    .badge.due { background: #0ea5e9; color: white; }
-    .badge.non_due { background: #94a3b8; color: white; }
-    .tag { font-size: 0.75rem; padding: 0.15rem 0.35rem; border-radius: 999px; background: #e2e8f0; color:#334155; }
-    .muted { color:#64748b; }
+    :root {
+      --lake-900:#0f4c5c; --lake-700:#2c7da0; --lake-500:#48a6c6; --lake-300:#90d4f7;
+      --sun-400:#ffd166; --sun-500:#fcbf49;
+      --leaf-500:#2a9d8f; --dune-50:#f6f4ee; --dune-100:#f0ece4;
+      --ink:#0b1320; --muted:#6b7280; --card: #ffffffcc;
+      --ring: rgba(15, 76, 92, .15);
+      --danger:#ef4444; --warning:#f59e0b; --success:#10b981;
+      --shadow: 0 10px 24px rgba(15,76,92,.12), 0 2px 8px rgba(15,76,92,.08);
+      --radius: 16px;
+    }
+    html, body { height:100%; background:
+      radial-gradient(1200px 800px at 80% -10%, var(--sun-400) 0%, transparent 60%),
+      radial-gradient(1200px 800px at -10% 120%, var(--lake-300) 0%, transparent 55%),
+      linear-gradient(180deg, #eef6fb 0%, var(--dune-50) 100%);
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      color: var(--ink);
+    }
+    header.hero {
+      margin: 0 0 1.5rem 0; border-radius: var(--radius);
+      padding: 1.25rem 1.25rem; background:
+      linear-gradient(135deg, rgba(72,166,198,.25), rgba(250, 240, 219,.45));
+      box-shadow: var(--shadow); display:flex; align-items:center; gap:1rem;
+    }
+    header.hero .title {
+      font-family: Catamaran, Inter, sans-serif; letter-spacing:.3px; margin:0;
+      font-weight:700; font-size: clamp(1.3rem, 2.2vw + .5rem, 2rem);
+      color: var(--lake-900);
+    }
+    nav.glass {
+      backdrop-filter: blur(6px);
+      background: rgba(255,255,255,.65);
+      border: 1px solid rgba(15,76,92,.08);
+      padding:.6rem .9rem; border-radius: 999px; box-shadow: var(--shadow);
+      display:flex; align-items:center; justify-content:space-between; gap: .75rem; margin: 1rem 0 1.25rem 0;
+    }
+    nav.glass a { color: var(--lake-900); font-weight:600; border-radius: 999px; padding:.45rem .8rem; }
+    nav.glass a:hover { background: rgba(72,166,198,.12); }
+    .wrap { max-width: 1100px; margin-inline: auto; padding: 0 1rem 2rem; }
+
+    .card {
+      background: var(--card); border: 1px solid rgba(15,76,92,.06);
+      border-radius: var(--radius); box-shadow: var(--shadow);
+      padding: 1.1rem 1.1rem;
+    }
+    .grid.tight { --pico-grid-gap: .85rem; }
+
+    .btn, button, input[type=submit]{
+      border-radius: 999px; border:1px solid rgba(15,76,92,.12);
+      box-shadow: 0 1px 0 rgba(255,255,255,.5) inset, 0 1px 2px rgba(0,0,0,.04);
+      background: linear-gradient(180deg, #fff, #f6fbff);
+      padding: .55rem 1rem; font-weight:600;
+    }
+    .btn-primary{
+      background: linear-gradient(180deg, var(--lake-500), var(--lake-700));
+      color:#fff; border-color: transparent;
+    }
+    .btn-primary:hover{ filter: saturate(1.05) brightness(1.02); }
+
+    /* Table polish */
+    table[role=grid] { background:#fff; border-radius: var(--radius); overflow:hidden; box-shadow: var(--shadow); }
+    thead th { background: linear-gradient(180deg, #f8fbfd, #eef6fb); color: var(--lake-900); }
+    tbody tr:hover { background: #f9fcff; }
+
+    /* Badges & tags */
+    .badge { padding:.24rem .5rem; border-radius: 999px; font-size:.75rem; font-weight:700; }
+    .badge.due { background: var(--leaf-500); color:white; }
+    .badge.non_due { background: var(--lake-700); color:white; }
+    .tag { font-size: .75rem; padding:.22rem .5rem; border-radius:999px; background:#eef2f7; color:#334155; }
+
+    /* Toast-style flash messages */
+    .toasts { position: fixed; top: 14px; right: 14px; display:flex; gap:.5rem; flex-direction:column; z-index: 9999; }
+    .toast { padding:.7rem 1rem; border-radius: 10px; box-shadow: var(--shadow); border:1px solid rgba(15,76,92,.08); background:#fff; }
+    .toast.success { border-left: 6px solid var(--success); }
+    .toast.info    { border-left: 6px solid var(--lake-500); }
+    .toast.warning { border-left: 6px solid var(--warning); }
+    .toast.danger  { border-left: 6px solid var(--danger); }
+
+    /* Flatpickr disabled dates look clearly off-limits */
+    .flatpickr-day.disabled, .flatpickr-day.disabled:hover {
+      background: repeating-linear-gradient(45deg, #eaeff5, #eaeff5 6px, #dfe7ee 6px, #dfe7ee 12px);
+      color:#b0b9c4; cursor:not-allowed; text-decoration: line-through;
+    }
+    .flatpickr-day.selected { background: var(--lake-700); border-color: var(--lake-700); }
+    .flatpickr-day.today { border-color: var(--lake-500); }
+
+    /* Forms */
+    label > input, label > textarea, label > select {
+      border-radius: 12px !important; border:1px solid rgba(15,76,92,.18);
+      box-shadow: none;
+    }
+    label > input:focus, label > textarea:focus, label > select:focus {
+      outline: 2px solid var(--ring);
+      border-color: var(--lake-500);
+    }
+    footer { color:#6b7280; }
+
+    /* Tiny helper */
+    .muted{ color:#6b7280; }
   </style>
 </head>
 <body>
-  <main class="container">
-    <nav>
-      <ul><li><strong>Lake House Bookings</strong></li></ul>
-      <ul>
+  <div class="wrap">
+    <nav class="glass">
+      <div style="display:flex; align-items:center; gap:.6rem;">
+        <span style="width:36px;height:36px;border-radius:10px;background:linear-gradient(180deg,var(--lake-500),var(--lake-700));display:inline-block;box-shadow:var(--shadow)"></span>
+        <strong style="font-family:Catamaran,Inter,sans-serif;color:var(--lake-900);font-size:1.1rem;">Lake House</strong>
+      </div>
+      <div style="display:flex; gap:.35rem; align-items:center;">
         {% if session.get('user_member_id') %}
-          <li><a href="{{ url_for('dashboard') }}">Dashboard</a></li>
-          <li><a href="{{ url_for('request_booking') }}">New request</a></li>
-          <li><a href="{{ url_for('signout') }}">Sign out</a></li>
+          <a href="{{ url_for('dashboard') }}">Dashboard</a>
+          <a href="{{ url_for('request_booking') }}">New request</a>
+          <a href="{{ url_for('signout') }}">Sign out</a>
         {% else %}
-          <li><a href="{{ url_for('root') }}">Home</a></li>
-          <li><a href="{{ url_for('signin') }}">Sign in</a></li>
-          <li><a href="{{ url_for('signup') }}">Create account</a></li>
+          <a href="{{ url_for('root') }}">Home</a>
+          <a href="{{ url_for('signin') }}">Sign in</a>
+          <a href="{{ url_for('signup') }}">Create account</a>
         {% endif %}
-        <li><a href="{{ url_for('calendar_view') }}">Calendar</a></li>
-        <li><a href="{{ url_for('calendar_ics') }}">ICS feed</a></li>
-      </ul>
+        <a href="{{ url_for('calendar_view') }}">Calendar</a>
+        <a href="{{ url_for('calendar_ics') }}">ICS</a>
+      </div>
     </nav>
-    {% with messages = get_flashed_messages(with_categories=true) %}
-      {% if messages %}
-        <div>
+
+    <header class="hero">
+      <h1 class="title">{% block title %}Bookings{% endblock %}</h1>
+      <span class="muted">Easy summer stays by the lake</span>
+    </header>
+
+    <div class="toasts">
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
           {% for category, message in messages %}
-            <article class="{{ category }}">{{ message }}</article>
+            <div class="toast {{ category }}">{{ message }}</div>
           {% endfor %}
-        </div>
-      {% endif %}
-    {% endwith %}
+        {% endif %}
+      {% endwith %}
+    </div>
+
     {% block content %}{% endblock %}
-    <footer class="muted" style="margin-top:2rem">Flatpickr-disabled booked dates • End &gt; Start validation • Server conflict checks</footer>
-  </main>
+    <footer style="margin-top:2rem">Made for summer • Book with ease • <span class="muted">Lake breeze included</span></footer>
+  </div>
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
 </body></html>""",
 
 "landing.html": """{% extends "base.html" %}
+{% block title %}Welcome{% endblock %}
 {% block content %}
-  <hgroup>
-    <h2>Welcome to the Lake House</h2>
-    <p class="muted">Sign in to view your bookings and request new dates.</p>
-  </hgroup>
-  <div class="grid">
-    <a class="contrast" href="{{ url_for('signin') }}">Sign in</a>
-    <a href="{{ url_for('signup') }}">Create account</a>
-  </div>
+  <section class="card">
+    <hgroup>
+      <h2 style="margin:0">Welcome to the Lake House</h2>
+      <p class="muted" style="margin:.25rem 0 0">Sign in to view your bookings and request new dates.</p>
+    </hgroup>
+    <div class="grid tight" style="margin-top:1rem;">
+      <a class="btn btn-primary" href="{{ url_for('signin') }}">Sign in</a>
+      <a class="btn" href="{{ url_for('signup') }}">Create account</a>
+    </div>
+  </section>
 {% endblock %}""",
 
 "dashboard.html": """{% extends "base.html" %}
+{% block title %}Your bookings{% endblock %}
 {% block content %}
-  <h2>Your bookings</h2>
-  {% if upcoming or pending %}
-    {% if upcoming %}
-      <h3>Approved</h3>
-      <table role="grid">
-        <thead><tr><th>Dates</th><th>Notes</th><th>Created</th></tr></thead>
-        <tbody>
-          {% for r in upcoming %}
-            <tr>
-              <td>{{ r.start_date }} → {{ r.end_date }}</td>
-              <td>{{ r.notes or "-" }}</td>
-              <td><small>{{ r.created_at.strftime("%Y-%m-%d %H:%M") }}</small></td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+  <section class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:.75rem;">
+      <h2 style="margin:0">Your bookings</h2>
+      <a class="btn btn-primary" href="{{ url_for('request_booking') }}">Request new booking</a>
+    </div>
+
+    {% if upcoming or pending %}
+      {% if upcoming %}
+        <h3 style="margin-top:1rem">Approved</h3>
+        <table role="grid">
+          <thead><tr><th>Dates</th><th>Notes</th><th>Created</th></tr></thead>
+          <tbody>
+            {% for r in upcoming %}
+              <tr>
+                <td>{{ r.start_date }} → {{ r.end_date }}</td>
+                <td>{{ r.notes or "-" }}</td>
+                <td><small>{{ r.created_at.strftime("%Y-%m-%d %H:%M") }}</small></td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% endif %}
+      {% if pending %}
+        <h3 style="margin-top:1rem">Pending</h3>
+        <table role="grid">
+          <thead><tr><th>Dates</th><th>Notes</th><th>Created</th></tr></thead>
+          <tbody>
+            {% for r in pending %}
+              <tr>
+                <td>{{ r.start_date }} → {{ r.end_date }}</td>
+                <td>{{ r.notes or "-" }}</td>
+                <td><small>{{ r.created_at.strftime("%Y-%m-%d %H:%M") }}</small></td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% endif %}
+    {% else %}
+      <p class="muted">You have no bookings yet.</p>
     {% endif %}
-    {% if pending %}
-      <h3>Pending</h3>
-      <table role="grid">
-        <thead><tr><th>Dates</th><th>Notes</th><th>Created</th></tr></thead>
-        <tbody>
-          {% for r in pending %}
-            <tr>
-              <td>{{ r.start_date }} → {{ r.end_date }}</td>
-              <td>{{ r.notes or "-" }}</td>
-              <td><small>{{ r.created_at.strftime("%Y-%m-%d %H:%M") }}</small></td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    {% endif %}
-  {% else %}
-    <p>You have no bookings yet.</p>
-  {% endif %}
-  <p style="margin-top:1rem;"><a class="contrast" href="{{ url_for('request_booking') }}">Request new booking</a></p>
+  </section>
 {% endblock %}""",
 
 "request.html": """{% extends "base.html" %}
+{% block title %}Request a booking{% endblock %}
 {% block content %}
-  <h2>Request a booking</h2>
-  <form method="POST">
-    {{ form.hidden_tag() }}
-    <div class="grid">
-      <label>{{ form.name.label }} {{ form.name(size=32, readonly=me is not none) }}</label>
-      <label>{{ form.email.label }} {{ form.email(size=32, readonly=me is not none) }}</label>
-      <label>{{ form.phone.label }} {{ form.phone(size=20) }}</label>
-      <label>{{ form.member_type.label }} {{ form.member_type(disabled=me is not none) }}</label>
-      <label>Start {{ form.start_date(id="start_date", class_="date-input", placeholder="YYYY-MM-DD") }}</label>
-      <label>End {{ form.end_date(id="end_date", class_="date-input", placeholder="YYYY-MM-DD") }}</label>
-    </div>
-    <label>{{ form.notes.label }} {{ form.notes(rows=3) }}</label>
-    <label>{{ form.subscribe_sms() }} {{ form.subscribe_sms.label }}</label>
-    <button type="submit">Submit Request</button>
-  </form>
+  <section class="card">
+    <h2 style="margin:0 0 .5rem 0">Request a booking</h2>
+    <form method="POST">
+      {{ form.hidden_tag() }}
+      <div class="grid tight">
+        <label>{{ form.name.label }} {{ form.name(size=32, readonly=me is not none) }}</label>
+        <label>{{ form.email.label }} {{ form.email(size=32, readonly=me is not none) }}</label>
+        <label>{{ form.phone.label }} {{ form.phone(size=20) }}</label>
+        <label>{{ form.member_type.label }} {{ form.member_type(disabled=me is not none) }}</label>
+        <label>Start {{ form.start_date(id="start_date", class_="date-input", placeholder="YYYY-MM-DD") }}</label>
+        <label>End {{ form.end_date(id="end_date", class_="date-input", placeholder="YYYY-MM-DD") }}</label>
+      </div>
+      <label style="margin-top:.5rem">{{ form.notes.label }} {{ form.notes(rows=3) }}</label>
+      <label style="margin-top:.25rem">{{ form.subscribe_sms() }} {{ form.subscribe_sms.label }}</label>
+      <div style="margin-top:.75rem; display:flex; gap:.5rem;">
+        <button type="submit" class="btn btn-primary">Submit Request</button>
+        <a class="btn" href="{{ url_for('dashboard') }}">Cancel</a>
+      </div>
+    </form>
+  </section>
 
   <script>
     async function initPickers() {
@@ -254,9 +375,9 @@ DEFAULT_TEMPLATES = {
 
         const common = {
           dateFormat: "Y-m-d",
-          disableMobile: true,      // force Flatpickr (no native pickers)
+          disableMobile: true,
           allowInput: false,
-          disable: disabledRanges,  // greys out & blocks selection
+          disable: disabledRanges,
           onChange: function(selectedDates, dateStr, instance) {
             if (selectedDates.length && isBlockedDate(selectedDates[0])) {
               alert("Those dates conflict with an existing booking. Please choose different dates.");
@@ -287,43 +408,56 @@ DEFAULT_TEMPLATES = {
 {% endblock %}""",
 
 "auth_signin.html": """{% extends "base.html" %}
+{% block title %}Sign in{% endblock %}
 {% block content %}
-  <h2>Sign in</h2>
-  <form method="POST">
-    {{ form.hidden_tag() }}
-    <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
-    <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
-    <button type="submit">Sign in</button>
-  </form>
-  <p class="muted">No account? <a href="{{ url_for('signup') }}">Create one</a></p>
+  <section class="card">
+    <h2 style="margin:0 0 .5rem 0">Sign in</h2>
+    <form method="POST">
+      {{ form.hidden_tag() }}
+      <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
+      <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
+      <div style="margin-top:.5rem; display:flex; gap:.5rem;">
+        <button type="submit" class="btn btn-primary">Sign in</button>
+        <a class="btn" href="{{ url_for('signup') }}">Create account</a>
+      </div>
+    </form>
+  </section>
 {% endblock %}""",
 
 "auth_signup.html": """{% extends "base.html" %}
+{% block title %}Create account{% endblock %}
 {% block content %}
-  <h2>Create account</h2>
-  <form method="POST">
-    {{ form.hidden_tag() }}
-    <label>{{ form.name.label }} {{ form.name(size=32) }}</label>
-    <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
-    <label>{{ form.phone.label }} {{ form.phone(size=20) }}</label>
-    <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
-    <button type="submit">Create account</button>
-  </form>
-  <p class="muted">Already have an account? <a href="{{ url_for('signin') }}">Sign in</a></p>
+  <section class="card">
+    <h2 style="margin:0 0 .5rem 0">Create account</h2>
+    <form method="POST">
+      {{ form.hidden_tag() }}
+      <label>{{ form.name.label }} {{ form.name(size=32) }}</label>
+      <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
+      <label>{{ form.phone.label }} {{ form.phone(size=20) }}</label>
+      <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
+      <div style="margin-top:.5rem; display:flex; gap:.5rem;">
+        <button type="submit" class="btn btn-primary">Create account</button>
+        <a class="btn" href="{{ url_for('signin') }}">Sign in</a>
+      </div>
+    </form>
+  </section>
 {% endblock %}""",
 
 "calendar_embed.html": """{% extends "base.html" %}
+{% block title %}Calendar{% endblock %}
 {% block content %}
-<h2>Lake House Calendar</h2>
-{% if embed_src %}
-  <iframe src="{{ embed_src }}" style="border:0; width:100%; height:75vh;" frameborder="0" scrolling="no"></iframe>
-  <p class="muted" style="margin-top:0.75rem;">Need an ICS? <a href="{{ url_for('calendar_ics') }}">Subscribe to the iCal feed</a>.</p>
-{% else %}
-  <article class="warning">
-    <strong>Calendar not configured.</strong>
-    <p>Set <code>GOOGLE_CALENDAR_EMBED_ID</code> (recommended) or <code>GOOGLE_CALENDAR_ID</code> and redeploy.</p>
-  </article>
-{% endif %}
+  <section class="card">
+    <h2 style="margin:0 0 .5rem 0">Lake House Calendar</h2>
+    {% if embed_src %}
+      <iframe src="{{ embed_src }}" style="border:0; width:100%; height:75vh; border-radius:12px" frameborder="0" scrolling="no"></iframe>
+      <p class="muted" style="margin-top:0.75rem;">Need an ICS? <a href="{{ url_for('calendar_ics') }}">Subscribe to the iCal feed</a>.</p>
+    {% else %}
+      <article class="warning">
+        <strong>Calendar not configured.</strong>
+        <p>Set <code>GOOGLE_CALENDAR_EMBED_ID</code> (recommended) or <code>GOOGLE_CALENDAR_ID</code> and redeploy.</p>
+      </article>
+    {% endif %}
+  </section>
 {% endblock %}""",
 }
 
@@ -331,6 +465,7 @@ def _ensure_templates_present():
     TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
     for name, content in DEFAULT_TEMPLATES.items():
         p = TEMPLATES_DIR / name
+        # Always (re)write if file missing; if present, keep user's edits
         if not p.exists():
             p.write_text(content, encoding="utf-8")
             app.logger.info(f"[bootstrap] wrote missing template: {p}")
@@ -603,7 +738,6 @@ def request_booking():
         db.session.add(br); db.session.commit()
         _log("create", br.id, f"Created by {m.email}")
         flash("Request submitted! We’ll email you after review.", "success")
-        # If the user wasn’t signed in, keep them anonymous but show success
         return redirect(url_for("dashboard") if current_member() else url_for("root"))
 
     return render_template("request.html", form=form, me=m)
@@ -623,7 +757,7 @@ def api_booked_dates():
     # Optionally merge GCal all-day/timed events as blocked (non-authoritative)
     try:
         if GOOGLE_OK and os.getenv("GOOGLE_CALENDAR_ID"):
-            # Use a wide window to gather conflicts (next 18 months)
+            # Use a wide window to gather conflicts (next ~18 months)
             today = date.today()
             horizon = today + timedelta(days=548)
             items = _gcal_list_events_between(today, horizon)
@@ -634,12 +768,11 @@ def api_booked_dates():
                     g_end_excl = datetime.fromisoformat(e_raw["date"]).date()
                 else:
                     g_end_excl = _parse_gcal_date_or_datetime(e_raw) + timedelta(days=1)
-                # add inclusive range
                 ranges.append({"from": g_start.isoformat(), "to": (g_end_excl - timedelta(days=1)).isoformat()})
     except Exception as e:
         print(f"[api_booked_dates] gcal merge failed: {e}")
 
-    # Merge overlapping ranges (simple sweep)
+    # Merge overlapping ranges
     if not ranges:
         return jsonify({"disabled": []})
     merged = []
@@ -647,12 +780,11 @@ def api_booked_dates():
         if not merged or r["from"] > merged[-1]["to"]:
             merged.append({"from": r["from"], "to": r["to"]})
         else:
-            # extend
             merged[-1]["to"] = max(merged[-1]["to"], r["to"])
     return jsonify({"disabled": merged})
 
 # --------------------------------
-# Calendar
+# Calendar views
 # --------------------------------
 @app.route("/calendar")
 def calendar_view():
