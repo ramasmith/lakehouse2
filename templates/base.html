@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lakehouse Bookings</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <style>
+    body {
+      background: linear-gradient(to bottom, #e0f7fa, #ffffff);
+      color: #334155;
+      font-family: "Inter", sans-serif;
+    }
+    nav {
+      background: #0284c7;
+      border-radius: 0 0 12px 12px;
+      padding: 0.8rem 1rem;
+      color: white;
+    }
+    nav ul li a {
+      color: white !important;
+      font-weight: 500;
+    }
+    nav ul li a:hover {
+      text-decoration: underline;
+    }
+    footer {
+      margin-top: 3rem;
+      text-align: center;
+      font-size: 0.85rem;
+      color: #64748b;
+    }
+    .flash-success {
+      background: #bbf7d0;
+      padding: 0.5rem;
+      border-radius: 6px;
+      margin-bottom: 1rem;
+    }
+    .flash-danger {
+      background: #fecaca;
+      padding: 0.5rem;
+      border-radius: 6px;
+      margin-bottom: 1rem;
+    }
+    .flash-info {
+      background: #bae6fd;
+      padding: 0.5rem;
+      border-radius: 6px;
+      margin-bottom: 1rem;
+    }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <nav>
+      <ul>
+        <li><strong>🏞 Lakehouse Bookings</strong></li>
+      </ul>
+      <ul>
+        <li><a href="{{ url_for('root') }}">Home</a></li>
+        {% if session.get('user_id') %}
+          <li><a href="{{ url_for('dashboard') }}">Dashboard</a></li>
+          <li><a href="{{ url_for('request_booking') }}">New Request</a></li>
+        {% endif %}
+        <li><a href="{{ url_for('calendar_view') }}">Calendar</a></li>
+        {% if session.get('is_admin') %}
+          <li><a href="{{ url_for('admin_requests') }}">Admin</a></li>
+          <li><a href="{{ url_for('admin_logout') }}">Logout</a></li>
+        {% else %}
+          <li><a href="{{ url_for('admin_login') }}">Admin</a></li>
+        {% endif %}
+        {% if session.get('user_id') %}
+          <li><a href="{{ url_for('logout') }}">Logout</a></li>
+        {% else %}
+          <li><a href="{{ url_for('login') }}">Login</a></li>
+          <li><a href="{{ url_for('signup') }}">Sign up</a></li>
+        {% endif %}
+      </ul>
+    </nav>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="flash-{{ category }}">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    {% block content %}{% endblock %}
+
+    <footer>
+      Built with Flask • Google Calendar sync • Booking conflicts prevented • ICS feed
+    </footer>
+  </main>
+</body>
+</html>
