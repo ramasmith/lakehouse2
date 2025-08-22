@@ -1,7 +1,5 @@
-# app.py — Lake House bookings (Render-safe, single-file, self-healing templates + accounts/history/exports + date disabling)
-import os, sys
-import socket
-import json, csv
+# app.py — Lake House bookings (Render-safe, accounts, self-healing templates, greyed-out booked dates)
+import os, sys, socket, json, csv
 from io import StringIO
 from pathlib import Path
 from datetime import datetime, date, timedelta
@@ -12,14 +10,13 @@ from flask import (
     redirect, url_for, flash, session, Response, jsonify, make_response
 )
 from jinja2 import TemplateNotFound
+from dotenv import load_dotenv
 
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import case, text, func
 from flask_wtf import FlaskForm
 from wtforms import StringField, SelectField, DateField, TextAreaField, SubmitField, BooleanField, PasswordField
 from wtforms.validators import DataRequired, Email, Length
-from dotenv import load_dotenv
-from apscheduler.schedulers.background import BackgroundScheduler
-from sqlalchemy import case, text, func
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # Notifications (SMTP)
@@ -29,7 +26,7 @@ from email.mime.text import MIMEText
 # Twilio (optional; DRY-RUN if missing)
 try:
     from twilio.rest import Client as TwilioClient
-except Exception:  # pragma: no cover
+except Exception:
     TwilioClient = None
 
 # Google Calendar (optional; DRY-RUN if missing)
@@ -38,7 +35,7 @@ try:
     from googleapiclient.discovery import build
     from google.auth.transport.requests import Request
     GOOGLE_OK = True
-except Exception:  # pragma: no cover
+except Exception:
     GOOGLE_OK = False
 
 load_dotenv()
@@ -48,10 +45,9 @@ TEMPLATES_DIR = BASE_DIR / "templates"
 
 app = Flask(__name__, template_folder=str(TEMPLATES_DIR))
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "dev-secret")
-# Consider persistent disk on Render: sqlite:////var/data/lakehouse.db
+# For Render persistent disk: sqlite:////var/data/lakehouse.db
 app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("SQLALCHEMY_DATABASE_URI", "sqlite:///lakehouse.db")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
 db = SQLAlchemy(app)
 
 # -----------------------------
@@ -60,7 +56,7 @@ db = SQLAlchemy(app)
 class Member(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(120), nullable=False)
-    email = db.Column(db.String(255), nullable=False, unique=True)
+    email = db.Column(db.String(255), nullable=False)
     phone = db.Column(db.String(32), nullable=True)
     member_type = db.Column(db.String(32), nullable=False, default="non_due")  # "due" or "non_due"
     password_hash = db.Column(db.String(255), nullable=True)
@@ -98,8 +94,8 @@ class DataTransaction(db.Model):
     status = db.Column(db.String(20), nullable=False)    # "success","error","skip"
     booking_request_id = db.Column(db.Integer, db.ForeignKey('booking_request.id'))
     member_id = db.Column(db.Integer, db.ForeignKey('member.id'))
-    target = db.Column(db.String(255))                   # email addr, phone, calendarId/eventId
-    meta_json = db.Column(db.Text)                       # JSON payload/response/error
+    target = db.Column(db.String(255))
+    meta_json = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     booking_request = db.relationship("BookingRequest", lazy=True)
     member = db.relationship("Member", lazy=True)
@@ -121,13 +117,11 @@ class BookingRequestHistory(db.Model):
 # Forms
 # -----------------------------
 class RequestForm(FlaskForm):
+    # Name/email only editable if not signed in
     name = StringField("Your Name", validators=[DataRequired(), Length(max=120)])
     email = StringField("Email", validators=[DataRequired(), Email()])
     phone = StringField("Phone (optional)")
-    member_type = SelectField("Membership Type", choices=[
-        ("due", "Due-paying member"),
-        ("non_due", "Non due-paying member")
-    ], validators=[DataRequired()])
+    member_type = SelectField("Membership Type", choices=[("due","Due-paying member"),("non_due","Non due-paying member")], validators=[DataRequired()])
     start_date = DateField("Start Date", validators=[DataRequired()], format="%Y-%m-%d")
     end_date = DateField("End Date", validators=[DataRequired()], format="%Y-%m-%d")
     notes = TextAreaField("Notes (optional)")
@@ -151,21 +145,22 @@ class SigninForm(FlaskForm):
     password = PasswordField("Password", validators=[DataRequired()])
     submit = SubmitField("Sign in")
 
-# --- SELF-HEALING TEMPLATES ---
+# -----------------------------
+# Self-healing templates (now including Flatpickr & disabled dates)
+# -----------------------------
 DEFAULT_TEMPLATES = {
     "base.html": """<!doctype html>
 <html lang="en"><head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Lake House Bookings</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
-  <!-- Flatpickr for better date disabling -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
   <style>
     .badge { padding: 0.2rem 0.4rem; border-radius: 4px; font-size: 0.75rem; }
     .badge.due { background: #0ea5e9; color: white; }
     .badge.non_due { background: #94a3b8; color: white; }
     .tag { font-size: 0.75rem; padding: 0.15rem 0.35rem; border-radius: 999px; background: #e2e8f0; color:#334155; }
-    code { font-size: 0.8rem; }
+    .flatpickr-day.disabled, .flatpickr-day.disabled:hover { background: #e5e7eb !important; color: #9ca3af !important; cursor: not-allowed; }
   </style>
 </head>
 <body>
@@ -173,16 +168,16 @@ DEFAULT_TEMPLATES = {
     <nav>
       <ul><li><strong>Lake House Bookings</strong></li></ul>
       <ul>
+        <li><a href="{{ url_for('dashboard') }}">Dashboard</a></li>
+        <li><a href="{{ url_for('request_booking') }}">New request</a></li>
+        <li><a href="{{ url_for('calendar_view') }}">Calendar</a></li>
+        <li><a href="{{ url_for('calendar_ics') }}">ICS feed</a></li>
         {% if session.get('user_member_id') %}
-          <li><a href="{{ url_for('dashboard') }}">Dashboard</a></li>
-          <li><a href="{{ url_for('request_booking') }}">Request Booking</a></li>
           <li><a href="{{ url_for('signout') }}">Sign out</a></li>
         {% else %}
           <li><a href="{{ url_for('signin') }}">Sign in</a></li>
           <li><a href="{{ url_for('signup') }}">Create account</a></li>
         {% endif %}
-        <li><a href="{{ url_for('calendar_view') }}">Calendar</a></li>
-        <li><a href="{{ url_for('calendar_ics') }}">ICS feed</a></li>
         {% if session.get('is_admin') %}
           <li><a href="{{ url_for('admin_requests') }}">Admin</a></li>
           <li><a href="{{ url_for('admin_logout') }}">Admin logout</a></li>
@@ -202,7 +197,7 @@ DEFAULT_TEMPLATES = {
     {% endwith %}
     {% block content %}{% endblock %}
     <footer style="margin-top:3rem; font-size:0.9rem; color:#64748b;">
-      Built with Flask • Conflict detection • Dues priority • Audit log • ICS feed • Accounts • Disabled dates
+      Built with Flask • Accounts • Conflict detection • Google Calendar (optional) • ICS feed
     </footer>
   </main>
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
@@ -210,128 +205,123 @@ DEFAULT_TEMPLATES = {
 
     "landing.html": """{% extends "base.html" %}
 {% block content %}
-<section>
-  <h2>Welcome to the Lake House portal</h2>
-  <p>Please sign in to view your bookings and request a new stay.</p>
-  <div class="grid">
-    <a class="contrast" href="{{ url_for('signin') }}">Sign in</a>
-    <a href="{{ url_for('signup') }}">Create account</a>
-  </div>
-</section>
+  <article>
+    <h2>Welcome to the Lake House booking portal</h2>
+    {% if session.get('user_member_id') %}
+      <p>You’re signed in. Head to your <a href="{{ url_for('dashboard') }}">dashboard</a> to review or request bookings.</p>
+    {% else %}
+      <p>Please <a href="{{ url_for('signin') }}">sign in</a> or <a href="{{ url_for('signup') }}">create an account</a> to request stays and view your booking history.</p>
+    {% endif %}
+  </article>
 {% endblock %}""",
 
     "dashboard.html": """{% extends "base.html" %}
 {% block content %}
-<h2>Dashboard</h2>
-<p><strong>{{ me.name }}</strong> &lt;{{ me.email }}&gt;</p>
-<p>
-  <a href="{{ url_for('request_booking') }}" role="button">Request New Booking</a>
-</p>
-
-<h3>Upcoming (approved)</h3>
-{% if upcoming %}
-<table role="grid">
-  <thead><tr><th>Dates</th><th>Notes</th></tr></thead>
-  <tbody>
-    {% for r in upcoming %}
-      <tr><td>{{ r.start_date }} → {{ r.end_date }}</td><td>{{ r.notes or "-" }}</td></tr>
-    {% endfor %}
-  </tbody>
-</table>
-{% else %}
-<p>No upcoming bookings.</p>
-{% endif %}
-
-<h3>Pending</h3>
-{% if pending %}
-<table role="grid">
-  <thead><tr><th>Dates</th><th>Notes</th></tr></thead>
-  <tbody>
-    {% for r in pending %}
-      <tr><td>{{ r.start_date }} → {{ r.end_date }}</td><td>{{ r.notes or "-" }}</td></tr>
-    {% endfor %}
-  </tbody>
-</table>
-{% else %}
-<p>No pending requests.</p>
-{% endif %}
+  <h2>My bookings</h2>
+  {% if upcoming or pending %}
+    {% if upcoming %}
+      <h3>Approved & upcoming</h3>
+      <table role="grid"><thead><tr><th>Dates</th><th>Notes</th><th>Created</th></tr></thead>
+      <tbody>
+        {% for r in upcoming %}
+          <tr>
+            <td>{{ r.start_date }} → {{ r.end_date }}</td>
+            <td>{{ r.notes or '-' }}</td>
+            <td><small>{{ r.created_at.strftime('%Y-%m-%d %H:%M') }}</small></td>
+          </tr>
+        {% endfor %}
+      </tbody></table>
+    {% endif %}
+    {% if pending %}
+      <h3>Pending</h3>
+      <table role="grid"><thead><tr><th>Dates</th><th>Notes</th><th>Created</th></tr></thead>
+      <tbody>
+        {% for r in pending %}
+          <tr>
+            <td>{{ r.start_date }} → {{ r.end_date }}</td>
+            <td>{{ r.notes or '-' }}</td>
+            <td><small>{{ r.created_at.strftime('%Y-%m-%d %H:%M') }}</small></td>
+          </tr>
+        {% endfor %}
+      </tbody></table>
+    {% endif %}
+  {% else %}
+    <p>You have no bookings yet. <a href="{{ url_for('request_booking') }}">Request one</a>.</p>
+  {% endif %}
 {% endblock %}""",
 
-    "request_booking.html": """{% extends "base.html" %}
+    "request.html": """{% extends "base.html" %}
 {% block content %}
-<h2>Request time at the Lake House</h2>
-<form method="POST" id="reqForm">
-  {{ form.hidden_tag() }}
-  <div class="grid">
-    <label>{{ form.name.label }} {{ form.name(size=32) }}</label>
-    <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
-    <label>{{ form.phone.label }} {{ form.phone(size=20) }}</label>
-    <label>{{ form.member_type.label }} {{ form.member_type() }}</label>
-    <label>{{ form.start_date.label }} {{ form.start_date(id="start_date") }}</label>
-    <label>{{ form.end_date.label }} {{ form.end_date(id="end_date") }}</label>
-  </div>
-  <label>{{ form.notes.label }} {{ form.notes(rows=3) }}</label>
-  <label>{{ form.subscribe_sms() }} {{ form.subscribe_sms.label }}</label>
-  <button type="submit">Submit Request</button>
-</form>
+  <h2>Request a booking</h2>
+  <form method="POST">
+    {{ form.hidden_tag() }}
+    <div class="grid">
+      <label>{{ form.name.label }} {{ form.name(size=32, readonly=me is not none) }}</label>
+      <label>{{ form.email.label }} {{ form.email(size=32, readonly=me is not none) }}</label>
+      <label>{{ form.phone.label }} {{ form.phone(size=20) }}</label>
+      <label>{{ form.member_type.label }} {{ form.member_type(disabled=me is not none) }}</label>
+      <label>Start {{ form.start_date(class_="date-input", id="start_date") }}</label>
+      <label>End {{ form.end_date(class_="date-input", id="end_date") }}</label>
+    </div>
+    <label>{{ form.notes.label }} {{ form.notes(rows=3) }}</label>
+    <label>{{ form.subscribe_sms() }} {{ form.subscribe_sms.label }}</label>
+    <button type="submit">Submit Request</button>
+  </form>
 
-<script>
-  // server-provided disabled ranges, e.g. [{from:"2025-08-02",to:"2025-08-05"}, ...]
-  const disabledRanges = {{ disabled_ranges_json|safe }};
-  // Optional: also disable individual dates array (when events are single-day)
-  const disabledDates = {{ disabled_dates_json|safe }};
+  <script>
+    // Fetch disabled ranges and initialize Flatpickr
+    async function initPickers() {
+      try {
+        const resp = await fetch("{{ url_for('api_booked_dates') }}");
+        const data = await resp.json(); // {disabled: [{from:'YYYY-MM-DD', to:'YYYY-MM-DD'}, ...]}
+        const disabledRanges = data.disabled || [];
 
-  // Helper to attach flatpickr with disabled ranges
-  function attachPicker(elId) {
-    flatpickr("#" + elId, {
-      dateFormat: "Y-m-d",
-      disable: disabledRanges.concat(disabledDates),
-      minDate: "today"
-    });
-  }
-  attachPicker("start_date");
-  attachPicker("end_date");
+        // Create a function that returns true if a date is inside a disabled range
+        function isDisabled(d) {
+          const iso = d.toISOString().slice(0,10);
+          for (const r of disabledRanges) {
+            if (iso >= r.from && iso <= r.to) return true;
+          }
+          return false;
+        }
 
-  // Client validation: end > start
-  const form = document.getElementById("reqForm");
-  form.addEventListener("submit", (e) => {
-    const s = document.getElementById("start_date").value;
-    const eDate = document.getElementById("end_date").value;
-    if (s && eDate) {
-      if (eDate <= s) {
-        e.preventDefault();
-        alert("End date must be after start date.");
-        return;
+        const common = {
+          dateFormat: "Y-m-d",
+          disable: disabledRanges,
+          onDayCreate: function(dObj, dStr, fp, dayElem){
+            // Flatpickr already greys out .disabled; extra hook here if needed
+          },
+          onChange: function(selectedDates, dateStr, instance) {
+            if (selectedDates.length) {
+              const d = selectedDates[0];
+              if (isDisabled(d)) {
+                alert("Those dates conflict with an existing booking. Please choose different dates.");
+                instance.clear();
+              }
+            }
+          }
+        };
+
+        const startPicker = flatpickr("#start_date", {
+          ...common,
+          onChange: function(selectedDates, dateStr, instance) {
+            common.onChange(selectedDates, dateStr, instance);
+            if (selectedDates.length) {
+              endPicker.set("minDate", selectedDates[0]);
+            } else {
+              endPicker.set("minDate", null);
+            }
+          }
+        });
+
+        const endPicker = flatpickr("#end_date", { ...common });
+
+      } catch (e) {
+        console.error("Failed to load disabled dates", e);
       }
     }
-  });
-</script>
-{% endblock %}""",
-
-    "auth_signup.html": """{% extends "base.html" %}
-{% block content %}
-<h2>Create account</h2>
-<form method="POST">
-  {{ form.hidden_tag() }}
-  <label>{{ form.name.label }} {{ form.name(size=32) }}</label>
-  <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
-  <label>{{ form.phone.label }} {{ form.phone(size=20) }}</label>
-  <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
-  <button type="submit">Create account</button>
-</form>
-<p>Already have an account? <a href="{{ url_for('signin') }}">Sign in</a></p>
-{% endblock %}""",
-
-    "auth_signin.html": """{% extends "base.html" %}
-{% block content %}
-<h2>Sign in</h2>
-<form method="POST">
-  {{ form.hidden_tag() }}
-  <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
-  <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
-  <button type="submit">Sign in</button>
-</form>
-<p>No account? <a href="{{ url_for('signup') }}">Create one</a></p>
+    initPickers();
+  </script>
 {% endblock %}""",
 
     "admin_login.html": """{% extends "base.html" %}
@@ -371,7 +361,8 @@ DEFAULT_TEMPLATES = {
         {% set g = gcal_conf.get(r.id) %}
         {% if g %}
           <span class="badge non_due">GCal conflict</span>
-          <details style="margin-top:0.25rem;"><summary>details</summary>
+          <details style="margin-top:0.25rem;">
+            <summary>details</summary>
             <ul style="margin:0.25rem 0 0 1rem;">
               {% for item in g %}<li>{{ item }}</li>{% endfor %}
             </ul>
@@ -441,20 +432,40 @@ DEFAULT_TEMPLATES = {
 {% block content %}
 <h2>Lake House Calendar</h2>
 {% if embed_src %}
-  <iframe
-    src="{{ embed_src }}"
-    style="border:0; width:100%; height:75vh;"
-    frameborder="0" scrolling="no">
-  </iframe>
-  <p style="margin-top:0.75rem;">
-    Need an ICS? <a href="{{ url_for('calendar_ics') }}">Subscribe to the iCal feed</a>.
-  </p>
+  <iframe src="{{ embed_src }}" style="border:0; width:100%; height:75vh;" frameborder="0" scrolling="no"></iframe>
+  <p style="margin-top:0.75rem;">Need an ICS? <a href="{{ url_for('calendar_ics') }}">Subscribe to the iCal feed</a>.</p>
 {% else %}
   <article class="warning">
     <strong>Calendar not configured.</strong>
     <p>Set <code>GOOGLE_CALENDAR_EMBED_ID</code> (recommended) or <code>GOOGLE_CALENDAR_ID</code> in Render, then redeploy.</p>
   </article>
 {% endif %}
+{% endblock %}""",
+
+    "auth_signup.html": """{% extends "base.html" %}
+{% block content %}
+<h2>Create account</h2>
+<form method="POST">
+  {{ form.hidden_tag() }}
+  <label>{{ form.name.label }} {{ form.name(size=32) }}</label>
+  <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
+  <label>{{ form.phone.label }} {{ form.phone(size=20) }}</label>
+  <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
+  <button type="submit">Create account</button>
+</form>
+<p>Already have an account? <a href="{{ url_for('signin') }}">Sign in</a></p>
+{% endblock %}""",
+
+    "auth_signin.html": """{% extends "base.html" %}
+{% block content %}
+<h2>Sign in</h2>
+<form method="POST">
+  {{ form.hidden_tag() }}
+  <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
+  <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
+  <button type="submit">Sign in</button>
+</form>
+<p>No account? <a href="{{ url_for('signup') }}">Create one</a></p>
 {% endblock %}""",
 }
 
@@ -470,12 +481,11 @@ def _ensure_templates_present():
         app.logger.error(f"[bootstrap] failed creating templates: {e}")
 
 _ensure_templates_present()
-# --- END SELF-HEALING TEMPLATES ---
 
 # -----------------------------
-# Auth helpers (members) & admin helpers
+# Auth helpers
 # -----------------------------
-def login_member(member: Member):
+def login_member(member: "Member"):
     session["user_member_id"] = member.id
 
 def logout_member():
@@ -483,9 +493,7 @@ def logout_member():
 
 def current_member():
     mid = session.get("user_member_id")
-    if not mid:
-        return None
-    return Member.query.get(mid)
+    return Member.query.get(mid) if mid else None
 
 def is_admin():
     return bool(session.get("is_admin"))
@@ -494,7 +502,7 @@ def current_admin_email():
     return os.getenv("ADMIN_EMAIL") if is_admin() else None
 
 # -----------------------------
-# Helpers: Email, SMS, Calendar, Logging
+# Email / SMS helpers + TX log
 # -----------------------------
 def send_email(to_email: str, subject: str, body: str) -> bool:
     host = os.getenv("SMTP_HOST")
@@ -504,11 +512,16 @@ def send_email(to_email: str, subject: str, body: str) -> bool:
     from_addr = os.getenv("EMAIL_FROM", user or "no-reply@lakehouse.local")
     secure = (os.getenv("SMTP_SECURE", "starttls") or "starttls").lower()
     timeout = int(os.getenv("SMTP_TIMEOUT", "20"))
+
     if not host or not port:
         print(f"[EMAIL DRY-RUN] To: {to_email} | Subj: {subject}\n{body}")
         return True
+
     msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject; msg["From"] = from_addr; msg["To"] = to_email
+    msg["Subject"] = subject
+    msg["From"] = from_addr
+    msg["To"] = to_email
+
     try:
         if secure == "ssl" or port == 465:
             with smtplib.SMTP_SSL(host=host, port=port, timeout=timeout) as server:
@@ -532,6 +545,7 @@ def send_sms(to_number: str, body: str) -> bool:
     token = os.getenv("TWILIO_AUTH_TOKEN")
     from_number = os.getenv("TWILIO_FROM_NUMBER")
     msid  = os.getenv("TWILIO_MESSAGING_SERVICE_SID")
+
     if not TwilioClient or not sid or not token or (not from_number and not msid):
         print(f"[SMS DRY-RUN] To: {to_number} | {body}")
         return True
@@ -539,7 +553,7 @@ def send_sms(to_number: str, body: str) -> bool:
         client = TwilioClient(sid, token)
         kwargs = {"to": to_number, "body": body}
         if msid: kwargs["messaging_service_sid"] = msid
-        else: kwargs["from_"] = from_number
+        else:    kwargs["from_"] = from_number
         msg = client.messages.create(**kwargs)
         print(f"[SMS OK] sid={msg.sid} to={to_number}")
         return True
@@ -559,6 +573,24 @@ def _tx(kind, status, booking=None, member=None, target=None, meta=None):
     except Exception as e:
         print(f"[TX-LOG ERROR] {e!r}")
 
+def _log(action, request_id, details=""):
+    db.session.add(AuditLog(action=action, request_id=request_id, admin_email=current_admin_email(), details=details))
+    db.session.commit()
+
+def _snapshot_booking(br: BookingRequest):
+    try:
+        db.session.add(BookingRequestHistory(
+            booking_request_id=br.id, admin_email=current_admin_email(),
+            status=br.status, start_date=br.start_date, end_date=br.end_date,
+            notes=br.notes, calendar_event_id=br.calendar_event_id,
+        ))
+        db.session.commit()
+    except Exception as e:
+        print(f"[HISTORY ERROR] {e!r}")
+
+# -----------------------------
+# Google Calendar helpers
+# -----------------------------
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 def _get_google_creds():
@@ -573,7 +605,8 @@ def _get_google_creds():
                 creds.refresh(Request())
                 with open(token_path, "w") as f: f.write(creds.to_json())
             except Exception as e:
-                print(f"[Calendar] Refresh failed: {e}"); return None
+                print(f"[Calendar] Refresh failed: {e}")
+                return None
         return creds
     print("[Calendar] token.json not found; skipping calendar sync on server.")
     return None
@@ -587,20 +620,23 @@ def add_event_to_calendar(summary, start_date, end_date, description=""):
     if not creds: return None
     try:
         service = build("calendar", "v3", credentials=creds)
-        body = {
-            "summary": summary, "description": description,
+        event_body = {
+            "summary": summary,
+            "description": description,
             "start": {"date": start_date.isoformat()},
             "end": {"date": (end_date + timedelta(days=1)).isoformat()},
         }
-        event = service.events().insert(calendarId=calendar_id, body=body).execute()
+        event = service.events().insert(calendarId=calendar_id, body=event_body).execute()
         print(f"[Calendar] Inserted event id={event.get('id')}")
         return event.get("id")
     except Exception as e:
-        print(f"[Calendar] Insert failed: {e!r}"); return None
+        print(f"[Calendar] Insert failed: {e!r}")
+        return None
 
 def remove_event_from_calendar(event_id):
     calendar_id = os.getenv("GOOGLE_CALENDAR_ID")
-    if not (calendar_id and event_id and GOOGLE_OK): return False
+    if not (calendar_id and event_id and GOOGLE_OK):
+        return False
     creds = _get_google_creds()
     if not creds: return False
     try:
@@ -609,13 +645,12 @@ def remove_event_from_calendar(event_id):
         print(f"[Calendar] Deleted event id={event_id}")
         return True
     except Exception as e:
-        print(f"[Calendar] Failed to delete event: {e}"); return False
+        print(f"[Calendar] Failed to delete event: {e}")
+        return False
 
-# --- Google Calendar conflict checks ---------------------------------
 def _parse_gcal_date_or_datetime(when: dict):
     if "date" in when and when["date"]:
-        d = datetime.fromisoformat(when["date"])
-        return d.date()
+        return datetime.fromisoformat(when["date"]).date()
     dt_raw = when.get("dateTime")
     if not dt_raw: return date.today()
     if dt_raw.endswith("Z"): dt_raw = dt_raw[:-1] + "+00:00"
@@ -631,23 +666,21 @@ def _parse_gcal_date_or_datetime(when: dict):
 def _gcal_list_events_between(start_date: date, end_date: date):
     calendar_id = os.getenv("GOOGLE_CALENDAR_ID")
     if not (calendar_id and GOOGLE_OK):
-        print("[Calendar] Conflict check skipped (no GOOGLE_CALENDAR_ID or google libs).")
         return []
     creds = _get_google_creds()
     if not creds:
-        print("[Calendar] Conflict check skipped (no token.json/creds).")
         return []
     time_min = datetime.combine(start_date, datetime.min.time()).isoformat() + "Z"
     time_max = datetime.combine(end_date + timedelta(days=1), datetime.min.time()).isoformat() + "Z"
     try:
         service = build("calendar", "v3", credentials=creds)
-        events = service.events().list(
+        return service.events().list(
             calendarId=calendar_id, timeMin=time_min, timeMax=time_max,
             singleEvents=True, orderBy="startTime",
         ).execute().get("items", [])
-        return events
     except Exception as e:
-        print(f"[Calendar] Conflict list failed: {e!r}"); return []
+        print(f"[Calendar] Conflict list failed: {e!r}")
+        return []
 
 def find_calendar_conflicts(start_date: date, end_date: date):
     items = _gcal_list_events_between(start_date, end_date)
@@ -655,7 +688,8 @@ def find_calendar_conflicts(start_date: date, end_date: date):
     req_start = start_date
     req_end_exclusive = end_date + timedelta(days=1)
     for ev in items:
-        s_raw = ev.get("start", {}); e_raw = ev.get("end", {})
+        s_raw = ev.get("start", {})
+        e_raw = ev.get("end", {})
         g_start = _parse_gcal_date_or_datetime(s_raw)
         if "date" in e_raw and e_raw.get("date"):
             g_end_exclusive = datetime.fromisoformat(e_raw["date"]).date()
@@ -668,10 +702,35 @@ def find_calendar_conflicts(start_date: date, end_date: date):
             disp_end = (g_end_exclusive - timedelta(days=1)).isoformat()
             conflicts.append(f"{title} [{disp_start} → {disp_end}]")
     return conflicts
-# ---------------------------------------------------------------------
+
+# For disabled dates API we also want raw busy ranges from Google Calendar
+def gcal_busy_ranges():
+    calendar_id = os.getenv("GOOGLE_CALENDAR_ID")
+    if not (calendar_id and GOOGLE_OK):
+        return []
+    creds = _get_google_creds()
+    if not creds:
+        return []
+    # pull a window of +/- 1 year
+    start_date = date.today() - timedelta(days=365)
+    end_date = date.today() + timedelta(days=366)
+    items = _gcal_list_events_between(start_date, end_date)
+    ranges = []
+    for ev in items:
+        s_raw = ev.get("start", {})
+        e_raw = ev.get("end", {})
+        s = _parse_gcal_date_or_datetime(s_raw)
+        if "date" in e_raw and e_raw.get("date"):
+            # all-day exclusive end
+            e_ex = datetime.fromisoformat(e_raw["date"]).date()
+            e = e_ex - timedelta(days=1)
+        else:
+            e = _parse_gcal_date_or_datetime(e_raw)
+        ranges.append({"from": s.isoformat(), "to": e.isoformat(), "src": "gcal"})
+    return ranges
 
 # -----------------------------
-# Business rules & helpers
+# Business rules
 # -----------------------------
 def ranges_overlap(a_start, a_end, b_start, b_end):
     return not (a_end < b_start or b_end < a_start)
@@ -681,37 +740,6 @@ def find_conflicts(start_date, end_date, exclude_request_id=None):
     if exclude_request_id:
         q = q.filter(BookingRequest.id != exclude_request_id)
     return [r for r in q.all() if ranges_overlap(start_date, end_date, r.start_date, r.end_date)]
-
-def _log(action, request_id, details=""):
-    db.session.add(AuditLog(action=action, request_id=request_id, admin_email=current_admin_email(), details=details))
-    db.session.commit()
-
-def _snapshot_booking(br: BookingRequest):
-    try:
-        snap = BookingRequestHistory(
-            booking_request_id=br.id,
-            admin_email=current_admin_email(),
-            status=br.status,
-            start_date=br.start_date,
-            end_date=br.end_date,
-            notes=br.notes,
-            calendar_event_id=br.calendar_event_id,
-        )
-        db.session.add(snap); db.session.commit()
-    except Exception as e:
-        print(f"[HISTORY ERROR] {e!r}")
-
-def _notify_status(br: BookingRequest):
-    member = br.member
-    subj = f"Lake House request {br.status.upper()}: {br.start_date} - {br.end_date}"
-    body = f"Hi {member.name},\n\nYour request for {br.start_date} to {br.end_date} has been {br.status}."
-    if br.status == "approved": body += "\nWe added it to the lake house calendar."
-    elif br.status == "denied": body += "\nPlease contact the admin with any questions."
-    ok_email = send_email(member.email, subj, body)
-    _tx("email", "success" if ok_email else "error", booking=br, member=member, target=member.email, meta={"subject": subj})
-    if member.phone:
-        ok_sms = send_sms(member.phone, f"Lake House: your request {br.status} for {br.start_date} - {br.end_date}.")
-        _tx("sms", "success" if ok_sms else "error", booking=br, member=member, target=member.phone, meta={"preview": f"{br.status} {br.start_date}→{br.end_date}"})
 
 # -----------------------------
 # Ensure DB exists + indexes (Render-safe)
@@ -732,22 +760,168 @@ def _ensure_db():
         app._db_inited = True
 
 # -----------------------------
-# Routes — Public landing & auth
+# Public routes
 # -----------------------------
-@app.route("/", methods=["GET"])
+@app.route("/")
 def root():
-    # If signed in, go straight to the dashboard
-    if current_member():
+    if session.get("user_member_id"):
         return redirect(url_for("dashboard"))
     return render_template("landing.html")
 
-class _SignupForm(FlaskForm):
-    # (kept here to avoid name clash above if you already had one)
-    pass
+@app.route("/dashboard")
+def dashboard():
+    m = current_member()
+    if not m:
+        return redirect(url_for("signin"))
+    today = date.today()
+    upcoming = (BookingRequest.query.filter_by(member_id=m.id, status="approved")
+                .filter(BookingRequest.end_date >= today)
+                .order_by(BookingRequest.start_date.asc()).all())
+    pending = (BookingRequest.query.filter_by(member_id=m.id, status="pending")
+               .order_by(BookingRequest.created_at.desc()).all())
+    return render_template("dashboard.html", upcoming=upcoming, pending=pending)
 
+@app.route("/request", methods=["GET", "POST"])
+def request_booking():
+    m = current_member()
+    form = RequestForm()
+
+    # Pre-fill from account
+    if m:
+        form.name.data = m.name
+        form.email.data = m.email
+        form.phone.data = m.phone
+        form.member_type.data = m.member_type
+
+    if form.validate_on_submit():
+        # server-side rule: end date > start date
+        if form.end_date.data <= form.start_date.data:
+            flash("End date must be after start date.", "danger")
+            return render_template("request.html", form=form, me=m)
+
+        # Validate conflicts against approved bookings
+        conflicts = find_conflicts(form.start_date.data, form.end_date.data)
+        if conflicts:
+            flash("Those dates overlap with an approved booking. Please pick different dates.", "danger")
+            return render_template("request.html", form=form, me=m)
+
+        # Also check Google Calendar if configured (non-blocking warning)
+        gc_warnings = find_calendar_conflicts(form.start_date.data, form.end_date.data)
+        if gc_warnings:
+            flash("Warning: Google Calendar shows overlapping events: " + "; ".join(gc_warnings), "warning")
+
+        # Upsert member if not logged in
+        if not m:
+            email = form.email.data.strip().lower()
+            m = Member.query.filter(func.lower(Member.email) == email).first()
+            if not m:
+                m = Member(
+                    name=form.name.data.strip(),
+                    email=email,
+                    phone=form.phone.data.strip() if form.phone.data else None,
+                    member_type=form.member_type.data,
+                )
+                db.session.add(m)
+                db.session.flush()
+            else:
+                m.name = form.name.data.strip()
+                m.phone = form.phone.data.strip() if form.phone.data else m.phone
+                m.member_type = form.member_type.data
+
+        br = BookingRequest(
+            member_id=m.id,
+            start_date=form.start_date.data,
+            end_date=form.end_date.data,
+            notes=form.notes.data
+        )
+        db.session.add(br); db.session.commit()
+        _snapshot_booking(br)
+
+        # notify
+        admin_to = os.getenv("ADMIN_EMAIL", m.email)
+        ok_admin_email = send_email(
+            admin_to,
+            "New Lake House Booking Request",
+            f"{m.name} ({m.member_type}) requested {br.start_date} - {br.end_date}.\n"
+            f"Notes: {br.notes or '(none)'}\nReview: {request.url_root}admin/requests"
+        )
+        _tx("email", "success" if ok_admin_email else "error", booking=br, member=m, target=admin_to, meta={"subject": "New Lake House Booking Request"})
+
+        ok_user_email = send_email(
+            m.email,
+            "We received your lake house request",
+            f"Hi {m.name},\n\nWe received your request for {br.start_date} to {br.end_date}. We'll notify you once it's approved or denied.\n\nThanks!"
+        )
+        _tx("email", "success" if ok_user_email else "error", booking=br, member=m, target=m.email, meta={"subject": "We received your lake house request"})
+
+        if form.subscribe_sms.data and m.phone:
+            ok_user_sms = send_sms(m.phone, f"Lake House: request received for {br.start_date} - {br.end_date}.")
+            _tx("sms", "success" if ok_user_sms else "error", booking=br, member=m, target=m.phone, meta={"preview": f"request received {br.start_date}→{br.end_date}"})
+
+        flash("Request submitted! You'll receive an email confirmation.", "success")
+        if not session.get("user_member_id"):
+            # auto-sign in lightweight (optional)
+            login_member(m)
+        return redirect(url_for("dashboard"))
+
+    return render_template("request.html", form=form, me=m)
+
+# Old/new link aliases
+@app.route("/request-new")
+@app.route("/request_new")
+def request_new():
+    return redirect(url_for("request_booking"), code=302)
+
+# ---------- API: disabled dates ----------
+@app.route("/api/booked-dates")
+def api_booked_dates():
+    """
+    Return disabled date ranges for the datepicker.
+    Combines approved DB bookings + optional Google Calendar events.
+    JSON shape: {"disabled":[{"from":"YYYY-MM-DD","to":"YYYY-MM-DD"}, ...]}
+    """
+    ranges = []
+    # DB approved bookings
+    rows = (BookingRequest.query
+            .filter(BookingRequest.status == "approved")
+            .with_entities(BookingRequest.start_date, BookingRequest.end_date)
+            .all())
+    for s, e in rows:
+        ranges.append({"from": s.isoformat(), "to": e.isoformat(), "src": "db"})
+
+    # Optional Google Calendar ranges
+    try:
+        ranges.extend(gcal_busy_ranges())
+    except Exception as e:
+        app.logger.info(f"[api_booked_dates] gcal skipped or failed: {e}")
+
+    # Merge overlapping/adjacent ranges to keep the list small
+    if ranges:
+        merged = []
+        # sort by start date
+        srtd = sorted(ranges, key=lambda r: r["from"])
+        cur_s = srtd[0]["from"]; cur_e = srtd[0]["to"]
+        for r in srtd[1:]:
+            if r["from"] <= (datetime.fromisoformat(cur_e) + timedelta(days=1)).date().isoformat():
+                # overlap/adjacent
+                if r["to"] > cur_e:
+                    cur_e = r["to"]
+            else:
+                merged.append({"from": cur_s, "to": cur_e})
+                cur_s, cur_e = r["from"], r["to"]
+        merged.append({"from": cur_s, "to": cur_e})
+    else:
+        merged = []
+
+    return jsonify({"disabled": merged})
+
+# -----------------------------
+# Auth routes
+# -----------------------------
 @app.route("/signup", methods=["GET", "POST"])
 def signup():
-    if current_member(): return redirect(url_for("dashboard"))
+    if current_member():
+        return redirect(url_for("dashboard"))
     form = SignupForm()
     if form.validate_on_submit():
         email = form.email.data.strip().lower()
@@ -759,15 +933,14 @@ def signup():
             m = existing
             m.name = form.name.data.strip()
             m.phone = form.phone.data.strip() if form.phone.data else m.phone
-            m.set_password(form.password.data)
+            m.password_hash = generate_password_hash(form.password.data)
         else:
             m = Member(
-                name=form.name.data.strip(),
-                email=email,
+                name=form.name.data.strip(), email=email,
                 phone=form.phone.data.strip() if form.phone.data else None,
                 member_type="non_due",
+                password_hash=generate_password_hash(form.password.data),
             )
-            m.set_password(form.password.data)
             db.session.add(m)
         db.session.commit()
         login_member(m)
@@ -777,12 +950,13 @@ def signup():
 
 @app.route("/signin", methods=["GET", "POST"])
 def signin():
-    if current_member(): return redirect(url_for("dashboard"))
+    if current_member():
+        return redirect(url_for("dashboard"))
     form = SigninForm()
     if form.validate_on_submit():
         email = form.email.data.strip().lower()
         m = Member.query.filter(func.lower(Member.email) == email).first()
-        if not m or not m.password_hash or not m.check_password(form.password.data):
+        if not m or not m.password_hash or not check_password_hash(m.password_hash, form.password.data):
             flash("Invalid email or password.", "danger")
         else:
             login_member(m)
@@ -797,154 +971,7 @@ def signout():
     return redirect(url_for("root"))
 
 # -----------------------------
-# Routes — Dashboard & Request
-# -----------------------------
-@app.route("/dashboard")
-def dashboard():
-    m = current_member()
-    if not m:
-        return redirect(url_for("root"))
-    today = date.today()
-    upcoming = (BookingRequest.query
-                .filter_by(member_id=m.id, status="approved")
-                .filter(BookingRequest.end_date >= today)
-                .order_by(BookingRequest.start_date.asc())
-                .all())
-    pending = (BookingRequest.query
-               .filter_by(member_id=m.id, status="pending")
-               .order_by(BookingRequest.created_at.desc())
-               .all())
-    return render_template("dashboard.html", me=m, upcoming=upcoming, pending=pending)
-
-def _disabled_date_payload():
-    """
-    Build disabled ranges for Flatpickr from approved bookings.
-    Returns (ranges_list, dates_list) where:
-      ranges_list: [{from:"YYYY-MM-DD", to:"YYYY-MM-DD"}, ...]
-      dates_list: ["YYYY-MM-DD", ...]  # for one-off single days
-    """
-    approved = (BookingRequest.query
-                .filter(BookingRequest.status == "approved")
-                .order_by(BookingRequest.start_date.asc())
-                .all())
-    ranges = []
-    singles = []
-    for r in approved:
-        if r.start_date == r.end_date:
-            singles.append(r.start_date.isoformat())
-        else:
-            ranges.append({"from": r.start_date.isoformat(), "to": r.end_date.isoformat()})
-    return ranges, singles
-
-@app.route("/request", methods=["GET", "POST"])
-def request_booking():
-    m = current_member()
-    if not m:
-        flash("Please sign in first.", "warning")
-        return redirect(url_for("signin"))
-
-    form = RequestForm()
-    # Prefill with member info
-    if request.method == "GET":
-        form.name.data = m.name
-        form.email.data = m.email
-        form.phone.data = m.phone
-        form.member_type.data = m.member_type or "non_due"
-
-    # Build disabled ranges for the date pickers
-    ranges, singles = _disabled_date_payload()
-
-    if form.validate_on_submit():
-        # Server-side: end > start
-        if form.end_date.data <= form.start_date.data:
-            flash("End date must be after start date.", "danger")
-            return render_template("request_booking.html", form=form,
-                                   disabled_ranges_json=json.dumps(ranges),
-                                   disabled_dates_json=json.dumps(singles))
-
-        # Block overlaps against approved bookings
-        db_conflicts = find_conflicts(form.start_date.data, form.end_date.data)
-        if db_conflicts:
-            flash("Those dates overlap an existing approved booking. Please pick different dates.", "danger")
-            return render_template("request_booking.html", form=form,
-                                   disabled_ranges_json=json.dumps(ranges),
-                                   disabled_dates_json=json.dumps(singles))
-
-        # (Optional) Check GCal conflicts too, but do not block here — keep as heads-up
-        gc_conflicts = find_calendar_conflicts(form.start_date.data, form.end_date.data)
-        if gc_conflicts:
-            flash("Heads up: Google Calendar shows overlapping event(s). Admin will review.", "warning")
-
-        # Create/attach member (already signed in)
-        m.name = form.name.data.strip()
-        m.phone = form.phone.data.strip() if form.phone.data else m.phone
-        m.member_type = form.member_type.data or m.member_type
-
-        br = BookingRequest(
-            member_id=m.id,
-            start_date=form.start_date.data,
-            end_date=form.end_date.data,
-            notes=form.notes.data
-        )
-        db.session.add(br); db.session.commit()
-        _snapshot_booking(br)
-
-        # Notify admin + requester
-        admin_to = os.getenv("ADMIN_EMAIL", m.email)
-        ok_admin_email = send_email(
-            admin_to,
-            "New Lake House Booking Request",
-            f"{m.name} ({m.member_type}) requested {br.start_date} - {br.end_date}.\n"
-            f"Notes: {br.notes or '(none)'}\nReview: {request.url_root}admin/requests"
-        )
-        _tx("email", "success" if ok_admin_email else "error", booking=br, member=m, target=admin_to, meta={"subject": "New Lake House Booking Request"})
-
-        ok_user_email = send_email(
-            m.email,
-            "We received your lake house request",
-            f"Hi {m.name},\n\nWe received your request for {br.start_date} to {br.end_date}. "
-            "We'll notify you once it's approved or denied.\n\nThanks!"
-        )
-        _tx("email", "success" if ok_user_email else "error", booking=br, member=m, target=m.email, meta={"subject": "We received your lake house request"})
-
-        if form.subscribe_sms.data and m.phone:
-            ok_user_sms = send_sms(m.phone, f"Lake House: request received for {br.start_date} - {br.end_date}.")
-            _tx("sms", "success" if ok_user_sms else "error", booking=br, member=m, target=m.phone, meta={"preview": f"request received {br.start_date}→{br.end_date}"})
-
-        _log("create", br.id, f"Created by {m.email}")
-        flash("Request submitted! You'll receive an email confirmation.", "success")
-        return redirect(url_for("dashboard"))
-
-    return render_template("request_booking.html", form=form,
-                           disabled_ranges_json=json.dumps(ranges),
-                           disabled_dates_json=json.dumps(singles))
-
-# Aliases for older/new template links
-@app.route("/request-new")
-@app.route("/request_new")
-def request_new():
-    return redirect(url_for("request_booking"), code=302)
-
-
-# -----------------------------
-# Calendar embed
-# -----------------------------
-@app.route("/calendar")
-def calendar_view():
-    cal_id = os.getenv("GOOGLE_CALENDAR_EMBED_ID") or os.getenv("GOOGLE_CALENDAR_ID")
-    embed_src = None
-    if cal_id:
-        embed_src = (
-            "https://calendar.google.com/calendar/embed"
-            f"?src={quote(cal_id)}"
-            "&ctz=America%2FNew_York"
-            "&mode=MONTH"
-            "&showPrint=0&showTitle=0"
-        )
-    return render_template("calendar_embed.html", embed_src=embed_src, calendar_id=cal_id)
-
-# -----------------------------
-# Admin: auth + requests
+# Admin: login + requests
 # -----------------------------
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
@@ -967,24 +994,11 @@ def admin_login():
         return render_template("admin_login.html", form=form)
     except TemplateNotFound:
         app.logger.error("admin_login.html missing; rendering inline fallback")
-        return render_template_string("""
-          <!doctype html><html><head><meta charset="utf-8">
-          <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
-          <title>Admin Login (fallback)</title></head><body><main class="container">
-          <h2>Admin Login</h2>
-          <p style="color:#b91c1c">Template <code>templates/admin_login.html</code> not found; using fallback.</p>
-          <form method="POST">
-            {{ form.hidden_tag() }}
-            <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
-            <label>{{ form.password.label }} {{ form.password(size=32) }}</label>
-            <button type="submit">Sign in</button>
-          </form>
-          </main></body></html>
-        """, form=form), 200
+        return render_template_string("<h2>Admin Login fallback</h2>"), 200
 
 @app.route("/admin/logout")
 def admin_logout():
-    session.clear()
+    session.pop("is_admin", None)
     flash("Logged out.", "info")
     return redirect(url_for("root"))
 
@@ -996,29 +1010,24 @@ def admin_requests():
     dues_first = case((Member.member_type == "due", 0), else_=1)
 
     pending = (
-        db.session.query(BookingRequest)
-        .join(Member)
+        db.session.query(BookingRequest).join(Member)
         .filter(BookingRequest.status == "pending")
-        .order_by(dues_first.asc(), BookingRequest.created_at.asc())
-        .all()
+        .order_by(dues_first.asc(), BookingRequest.created_at.asc()).all()
     )
 
     approved = (
-        db.session.query(BookingRequest)
-        .join(Member)
+        db.session.query(BookingRequest).join(Member)
         .filter(BookingRequest.status == "approved")
-        .order_by(dues_first.asc(), BookingRequest.start_date.asc())
-        .all()
+        .order_by(dues_first.asc(), BookingRequest.start_date.asc()).all()
     )
 
     denied = (
-        db.session.query(BookingRequest)
-        .join(Member)
+        db.session.query(BookingRequest).join(Member)
         .filter(BookingRequest.status == "denied")
-        .order_by(BookingRequest.created_at.desc())
-        .all()
+        .order_by(BookingRequest.created_at.desc()).all()
     )
 
+    # GCal conflict annotations for pending
     gcal_conf = {}
     try:
         if GOOGLE_OK and os.getenv("GOOGLE_CALENDAR_ID"):
@@ -1027,40 +1036,45 @@ def admin_requests():
                     gcal_conf[r.id] = find_calendar_conflicts(r.start_date, r.end_date)
                 except Exception as e:
                     app.logger.warning(f"[gcal_conf] failed for req {r.id}: {e}")
-        else:
-            app.logger.info("[gcal_conf] skipped (no google libs or GOOGLE_CALENDAR_ID)")
     except Exception as e:
         app.logger.warning(f"[gcal_conf] top-level failure: {e}")
 
     return render_template(
         "admin_requests.html",
-        pending=pending,
-        approved=approved,
-        denied=denied,
+        pending=pending, approved=approved, denied=denied,
         logs=AuditLog.query.order_by(AuditLog.created_at.desc()).limit(50).all(),
         gcal_conf=gcal_conf,
     )
 
-# Actions
 @app.post("/admin/requests/<int:req_id>/approve")
 def approve_request(req_id):
     if not is_admin(): return redirect(url_for("admin_login"))
     br = BookingRequest.query.get_or_404(req_id)
+
+    # DB conflicts
     conflicts = find_conflicts(br.start_date, br.end_date, exclude_request_id=br.id)
     if conflicts:
         conflict_list = ", ".join(f"{c.member.name}({c.start_date}→{c.end_date})" for c in conflicts)
         flash(f"Cannot approve: date conflict with {conflict_list}.", "danger")
         return redirect(url_for("admin_requests"))
+
+    # GCal conflicts
     gc_conflicts = find_calendar_conflicts(br.start_date, br.end_date)
     if gc_conflicts:
-        flash("Cannot approve: Google Calendar already has overlapping event(s): " + "; ".join(gc_conflicts), "danger")
+        flash("Cannot approve: Google Calendar overlapping event(s): " + "; ".join(gc_conflicts), "danger")
         return redirect(url_for("admin_requests"))
+
     br.status = "approved"
     summary = f"Lake House: {br.member.name} ({br.member.member_type})"
     description = (br.notes or "") + f"\nMember email: {br.member.email}"
     event_id = add_event_to_calendar(summary, br.start_date, br.end_date, description)
     if event_id: br.calendar_event_id = event_id
-    db.session.commit(); _snapshot_booking(br); _notify_status(br); _log("approve", br.id, "Approved and synced to calendar")
+
+    db.session.commit()
+    _snapshot_booking(br)
+    # notify user
+    send_email(br.member.email, f"Lake House request APPROVED: {br.start_date} - {br.end_date}",
+               f"Hi {br.member.name}, your request has been approved and added to the calendar.")
     flash("Request approved and calendar updated.", "success")
     return redirect(url_for("admin_requests"))
 
@@ -1068,12 +1082,15 @@ def approve_request(req_id):
 def deny_request(req_id):
     if not is_admin(): return redirect(url_for("admin_login"))
     br = BookingRequest.query.get_or_404(req_id)
-    br.status = "denied"; ok_del = False
+    br.status = "denied"
+    ok_del = False
     if br.calendar_event_id:
         ok_del = remove_event_from_calendar(br.calendar_event_id)
-        _tx("gcal.delete", "success" if ok_del else "error", booking=br, member=br.member, target=os.getenv("GOOGLE_CALENDAR_ID"), meta={"event_id": br.calendar_event_id})
         br.calendar_event_id = None
-    db.session.commit(); _snapshot_booking(br); _notify_status(br); _log("deny", br.id, "Denied by admin")
+    db.session.commit()
+    _snapshot_booking(br)
+    send_email(br.member.email, f"Lake House request DENIED: {br.start_date} - {br.end_date}",
+               f"Hi {br.member.name}, unfortunately your request was denied. Please contact admin with questions.")
     flash("Request denied." + (" Calendar event removed." if ok_del else ""), "info")
     return redirect(url_for("admin_requests"))
 
@@ -1081,36 +1098,43 @@ def deny_request(req_id):
 def cancel_request(req_id):
     if not is_admin(): return redirect(url_for("admin_login"))
     br = BookingRequest.query.get_or_404(req_id)
-    br.status = "cancelled"; ok_del = False
+    br.status = "cancelled"
+    ok_del = False
     if br.calendar_event_id:
         ok_del = remove_event_from_calendar(br.calendar_event_id)
-        _tx("gcal.delete", "success" if ok_del else "error", booking=br, member=br.member, target=os.getenv("GOOGLE_CALENDAR_ID"), meta={"event_id": br.calendar_event_id})
         br.calendar_event_id = None
-    db.session.commit(); _snapshot_booking(br); _notify_status(br); _log("cancel", br.id, "Cancelled by admin")
+    db.session.commit()
+    _snapshot_booking(br)
+    send_email(br.member.email, f"Lake House request CANCELLED: {br.start_date} - {br.end_date}",
+               f"Hi {br.member.name}, your request has been cancelled.")
     flash("Request cancelled." + (" Calendar event removed." if ok_del else ""), "warning")
     return redirect(url_for("admin_requests"))
 
 # -----------------------------
-# ICS feed
+# Calendar & ICS
 # -----------------------------
+@app.route("/calendar")
+def calendar_view():
+    cal_id = os.getenv("GOOGLE_CALENDAR_EMBED_ID") or os.getenv("GOOGLE_CALENDAR_ID")
+    embed_src = None
+    if cal_id:
+        embed_src = ("https://calendar.google.com/calendar/embed"
+                     f"?src={quote(cal_id)}&ctz=America%2FNew_York&mode=MONTH&showPrint=0&showTitle=0")
+    return render_template("calendar_embed.html", embed_src=embed_src, calendar_id=cal_id)
+
 @app.route("/calendar.ics")
 def calendar_ics():
     events = (BookingRequest.query
               .filter(BookingRequest.status == "approved")
-              .order_by(BookingRequest.start_date.asc())
-              .all())
+              .order_by(BookingRequest.start_date.asc()).all())
     def esc(s): return (s or "").replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
     def fold(line, limit=75):
         if len(line) <= limit: return [line]
         out = []
-        while len(line) > limit:
-            out.append(line[:limit]); line = " " + line[limit:]
+        while len(line) > limit: out.append(line[:limit]); line = " " + line[limit:]
         out.append(line); return out
 
-    lines = [
-        "BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//LakeHouse//Bookings//EN","CALSCALE:GREGORIAN","METHOD:PUBLISH",
-        "X-WR-CALNAME:Lake House Bookings",
-    ]
+    lines = ["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//LakeHouse//Bookings//EN","CALSCALE:GREGORIAN","METHOD:PUBLISH","X-WR-CALNAME:Lake House Bookings"]
     for r in events:
         uid = f"lakehouse-{r.id}@example.local"
         dtstamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -1118,23 +1142,20 @@ def calendar_ics():
         dtend = (r.end_date + timedelta(days=1)).strftime("%Y%m%d")
         summary = esc(f"Lake House: {r.member.name} ({r.member.member_type})")
         desc = esc((r.notes or "") + f"\\nMember email: {r.member.email}")
-        ev = [
-            "BEGIN:VEVENT",
-            f"UID:{uid}",
-            f"DTSTAMP:{dtstamp}",
-            f"DTSTART;VALUE=DATE:{dtstart}",
-            f"DTEND;VALUE=DATE:{dtend}",
-            f"SUMMARY:{summary}",
-            f"DESCRIPTION:{desc}",
-            "END:VEVENT",
-        ]
+        ev = ["BEGIN:VEVENT", f"UID:{uid}", f"DTSTAMP:{dtstamp}",
+              f"DTSTART;VALUE=DATE:{dtstart}", f"DTEND;VALUE=DATE:{dtend}",
+              f"SUMMARY:{summary}", f"DESCRIPTION:{desc}", "END:VEVENT"]
         for line in ev: lines.extend(fold(line))
     ics = "\r\n".join(lines + ["END:VCALENDAR"]) + "\r\n"
     return Response(ics, mimetype="text/calendar")
 
 # -----------------------------
-# Diagnostics & utilities
+# Diagnostics & utility
 # -----------------------------
+@app.route("/favicon.ico")
+def favicon():
+    return ("", 204)
+
 @app.route("/_diag")
 def _diag():
     try:
@@ -1158,63 +1179,92 @@ def _routes():
         rules.append({"rule": str(r), "endpoint": r.endpoint, "methods": methods})
     return jsonify(sorted(rules, key=lambda x: x["rule"]))
 
-@app.route("/admin/_diag")
-def admin_diag():
-    raw = os.getenv("ADMIN_EMAIL", "")
-    masked = (raw[:2] + "***" + raw[-2:]) if len(raw) >= 5 else ("***" if raw else "")
-    return {
-        "has_secret_key": bool(app.config.get("SECRET_KEY")),
-        "has_admin_email": bool(os.getenv("ADMIN_EMAIL")),
-        "admin_email_masked": masked,
-        "has_admin_password": bool(os.getenv("ADMIN_PASSWORD")),
-    }, 200
-
-# Email/SMS test endpoints (admin only)
-@app.route("/admin/_emailtest")
-def _emailtest():
-    if not is_admin(): return redirect(url_for("admin_login"))
-    to = request.args.get("to") or os.getenv("ADMIN_EMAIL")
-    if not to:
-        return jsonify({"ok": False, "error": "Provide ?to=someone@example.com or set ADMIN_EMAIL"}), 400
-    ok = send_email(to, "Lakehouse test email", "This is a test email from the Lakehouse app.")
-    _tx("email", "success" if ok else "error", target=to, meta={"subject": "Lakehouse test email"})
-    return jsonify({"ok": ok})
-
-@app.route("/admin/_smstest")
-def _smstest():
-    if not is_admin(): return redirect(url_for("admin_login"))
-    to = request.args.get("to")  # Must be E.164 like +15551234567
-    if not to:
-        return jsonify({"ok": False, "error": "Provide ?to=+1XXXXXXXXXX"}), 400
-    ok = send_sms(to, "Lakehouse test SMS: hello from the app.")
-    _tx("sms", "success" if ok else "error", target=to, meta={"preview": "Lakehouse test SMS"})
-    return jsonify({"ok": ok})
-
 # -----------------------------
 # Reminders (opt-in: set ENABLE_SCHEDULER=1)
 # -----------------------------
+from apscheduler.schedulers.background import BackgroundScheduler
 def send_upcoming_reminders():
-    today = date.today()
-    in_two_days = today + timedelta(days=2)
+    t = date.today()
+    in_two = t + timedelta(days=2)
     upcoming = BookingRequest.query.filter(
         BookingRequest.status == "approved",
-        BookingRequest.start_date == in_two_days
+        BookingRequest.start_date == in_two
     ).all()
     for br in upcoming:
-        ok_email = send_email(
+        send_email(
             br.member.email,
             "Lake House reminder",
             f"Hi {br.member.name}, your lake house stay starts on {br.start_date}. Enjoy!"
         )
-        _tx("email", "success" if ok_email else "error", booking=br, member=br.member, target=br.member.email, meta={"subject": "Lake House reminder"})
         if br.member.phone:
-            ok_sms = send_sms(br.member.phone, f"Reminder: your lake house stay starts on {br.start_date}.")
-            _tx("sms", "success" if ok_sms else "error", booking=br, member=br.member, target=br.member.phone, meta={"preview": "stay starts soon"})
+            send_sms(br.member.phone, f"Reminder: your lake house stay starts on {br.start_date}.")
 
 if os.getenv("ENABLE_SCHEDULER", "0") == "1":
     scheduler = BackgroundScheduler(daemon=True)
     scheduler.add_job(send_upcoming_reminders, "cron", hour=9, minute=0)
     scheduler.start()
+
+# -----------------------------
+# Admin exports
+# -----------------------------
+@app.route("/admin/exports/transactions.csv")
+def export_transactions_csv():
+    if not is_admin(): return redirect(url_for("admin_login"))
+    rows = DataTransaction.query.order_by(DataTransaction.created_at.desc()).all()
+    f = StringIO(); w = csv.writer(f)
+    w.writerow(["id","created_at","kind","status","booking_request_id","member_id","target","meta_json"])
+    for r in rows:
+        w.writerow([r.id, r.created_at.isoformat(), r.kind, r.status, r.booking_request_id, r.member_id, r.target, r.meta_json or "{}"])
+    return Response(f.getvalue(), mimetype="text/csv", headers={"Content-Disposition":"attachment; filename=transactions.csv"})
+
+@app.route("/admin/exports/requests.jsonl")
+def export_requests_jsonl():
+    if not is_admin(): return redirect(url_for("admin_login"))
+    rows = BookingRequest.query.order_by(BookingRequest.created_at.desc()).all()
+    out = []
+    for r in rows:
+        out.append({
+            "id": r.id,
+            "member": {"id": r.member.id, "name": r.member.name, "email": r.member.email, "type": r.member.member_type},
+            "start_date": r.start_date.isoformat(), "end_date": r.end_date.isoformat(),
+            "status": r.status, "calendar_event_id": r.calendar_event_id,
+            "created_at": r.created_at.isoformat(), "notes": r.notes,
+        })
+    return jsonify(out)
+
+@app.route("/admin/exports/history.csv")
+def export_history_csv():
+    if not is_admin(): return redirect(url_for("admin_login"))
+    rows = BookingRequestHistory.query.order_by(BookingRequestHistory.at.desc()).all()
+    f = StringIO(); w = csv.writer(f)
+    w.writerow(["id","at","booking_request_id","admin_email","status","start_date","end_date","calendar_event_id"])
+    for r in rows:
+        w.writerow([r.id, r.at.isoformat(), r.booking_request_id, r.admin_email or "", r.status, r.start_date.isoformat(), r.end_date.isoformat(), r.calendar_event_id or ""])
+    return Response(f.getvalue(), mimetype="text/csv", headers={"Content-Disposition":"attachment; filename=booking_history.csv"})
+
+# -----------------------------
+# Error pages
+# -----------------------------
+@app.errorhandler(404)
+def not_found(e):
+    html = """
+    <!doctype html><html><head>
+      <meta charset='utf-8'><title>Not Found</title>
+      <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    </head><body><main class="container">
+      <h2>Not Found</h2>
+      <p>The page you requested doesn’t exist. Try one of these:</p>
+      <ul>
+        <li><a href="/">Home</a></li>
+        <li><a href="/dashboard">Dashboard</a></li>
+        <li><a href="/request">New request</a></li>
+        <li><a href="/calendar">Calendar</a></li>
+        <li><a href="/_diag">Diagnostics</a></li>
+        <li><a href="/_routes">Route list</a></li>
+      </ul>
+    </main></body></html>
+    """
+    return make_response(html, 404)
 
 # -----------------------------
 # CLI
@@ -1231,31 +1281,6 @@ def init_db():
     except Exception as e:
         print(f"[INDEX WARN] {e!r}")
     print("Database initialized.")
-
-# -----------------------------
-# 404
-# -----------------------------
-@app.errorhandler(404)
-def not_found(e):
-    html = """
-    <!doctype html><html><head>
-      <meta charset='utf-8'><title>Not Found</title>
-      <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
-    </head><body><main class="container">
-      <h2>Not Found</h2>
-      <p>The page you requested doesn’t exist. Try one of these:</p>
-      <ul>
-        <li><a href="/">Home</a></li>
-        <li><a href="/dashboard">Dashboard</a></li>
-        <li><a href="/request">Request booking</a></li>
-        <li><a href="/calendar">Calendar</a></li>
-        <li><a href="/admin/login">Admin login</a></li>
-        <li><a href="/_diag">Diagnostics</a></li>
-        <li><a href="/_routes">Route list</a></li>
-      </ul>
-    </main></body></html>
-    """
-    return make_response(html, 404)
 
 # -----------------------------
 # Main
