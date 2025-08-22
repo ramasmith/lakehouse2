@@ -919,6 +919,13 @@ def request_booking():
                            disabled_ranges_json=json.dumps(ranges),
                            disabled_dates_json=json.dumps(singles))
 
+# Aliases for older/new template links
+@app.route("/request-new")
+@app.route("/request_new")
+def request_new():
+    return redirect(url_for("request_booking"), code=302)
+
+
 # -----------------------------
 # Calendar embed
 # -----------------------------
