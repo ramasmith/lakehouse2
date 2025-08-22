@@ -85,6 +85,26 @@ class AuditLog(db.Model):
     admin_email = db.Column(db.String(255))
     details = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+# --- Admin login (adds the missing 'admin_login' endpoint) ---
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    form = AdminLoginForm()
+    if request.method == "POST":
+        if not form.validate_on_submit():
+            flash("Please check your email and password.", "danger")
+        else:
+            admin_email = (os.getenv("ADMIN_EMAIL") or "").strip().lower()
+            admin_password = os.getenv("ADMIN_PASSWORD") or ""
+            ok_email = form.email.data.strip().lower() == admin_email
+            ok_pwd = form.password.data == admin_password
+            if ok_email and ok_pwd:
+                session["is_admin"] = True
+                flash("Welcome, admin!", "success")
+                return redirect(url_for("admin_requests"))
+            else:
+                flash("Invalid admin credentials.", "danger")
+    return render_template("admin_login.html", form=form)
 
 # --------------------------------
 # Forms
@@ -676,6 +696,18 @@ def dashboard():
                .order_by(BookingRequest.created_at.desc())
                .all())
     return render_template("dashboard.html", upcoming=upcoming, pending=pending)
+    
+@app.route("/admin/requests")
+def admin_requests():
+    if not session.get("is_admin"):
+        return redirect(url_for("admin_login"))
+    # ... your existing admin listing logic ...
+
+@app.route("/admin/logout")
+def admin_logout():
+    session.pop("is_admin", None)
+    flash("Admin logged out.", "info")
+    return redirect(url_for("root"))
 
 # --------------------------------
 # Request a booking
