@@ -709,6 +709,19 @@ def admin_logout():
     flash("Admin logged out.", "info")
     return redirect(url_for("root"))
 
+# --- Public auth aliases expected by templates ---
+@app.route("/login", methods=["GET", "POST"])
+def login():  # alias so url_for('login') works
+    return signin()
+
+@app.route("/logout")
+def logout():  # alias so url_for('logout') works
+    return signout()
+
+@app.route("/register", methods=["GET", "POST"])
+def register():  # alias so url_for('register') works if used anywhere
+    return signup()
+
 # --------------------------------
 # Request a booking
 # --------------------------------
