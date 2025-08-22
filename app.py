@@ -741,7 +741,12 @@ def request_booking():
         return redirect(url_for("dashboard") if current_member() else url_for("root"))
 
     return render_template("request.html", form=form, me=m)
-
+    
+# Back-compat alias so old templates don't crash
+@app.route("/request/new")
+def request_new():
+    return redirect(url_for("request_booking"), code=302)
+    
 # API for disabled date ranges (used by Flatpickr)
 @app.get("/api/booked-dates")
 def api_booked_dates():
