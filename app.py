@@ -1,4 +1,4 @@
-# app.py — Lake House bookings (Render-safe, self-healing templates, date blocking + logout)
+# app.py — Lake House bookings (Render-safe, self-healing templates, date blocking w/ end-day overlap allowed)
 import os, sys, json, csv, socket
 from io import StringIO
 from pathlib import Path
@@ -74,7 +74,7 @@ class BookingRequest(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     member_id = db.Column(db.Integer, db.ForeignKey('member.id'), nullable=False)
     start_date = db.Column(db.Date, nullable=False)
-    end_date = db.Column(db.Date, nullable=False)
+    end_date = db.Column(db.Date, nullable=False)  # stored as inclusive, but we TREAT as end-exclusive in logic
     notes = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     status = db.Column(db.String(16), nullable=False, default="pending")  # pending/approved/denied/cancelled
@@ -158,7 +158,7 @@ class SignupForm(FlaskForm):
     submit = SubmitField("Create account")
 
 # -----------------------------
-# Self-healing templates (includes datepicker + logout link)
+# Self-healing templates (Flatpickr + summer lake vibe)
 # -----------------------------
 DEFAULT_TEMPLATES = {
     "base.html": r"""<!doctype html>
@@ -168,7 +168,7 @@ DEFAULT_TEMPLATES = {
   <title>{{ title or 'Lake House' }}</title>
 
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
 
   <style>
     :root{
@@ -184,8 +184,6 @@ DEFAULT_TEMPLATES = {
     .badge{ padding:.2rem .45rem; border-radius:999px; font-size:.75rem; background:#e2f6fb; color:#0b4a5a; }
     .tag{ padding:.15rem .4rem; border-radius:999px; background:#eef2f7; color:#475569; font-size:.75rem;}
     footer{ color:#64748b; font-size:.9rem; }
-
-    /* Flatpickr: grey/block disabled days */
     .flatpickr-day.disabled,
     .flatpickr-day.disabled:hover{
       background:#f1f5f9;
@@ -236,9 +234,9 @@ DEFAULT_TEMPLATES = {
     </footer>
   </main>
 
-  <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+  <script src="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.js"></script>
   <script>
-    // Global datepicker initializer used by request form pages
+    // Global datepicker initializer
     async function initLakeDatepickers() {
       const pickers = document.querySelectorAll("input.datepicker");
       if (!pickers.length) return;
@@ -250,7 +248,6 @@ DEFAULT_TEMPLATES = {
       } catch (e) {
         console.warn("Failed to load blocked dates", e);
       }
-
       const blockedSet = new Set(blocked);
 
       function isBlocked(date){
@@ -262,7 +259,7 @@ DEFAULT_TEMPLATES = {
         if (!selDates.length) return;
         const iso = selDates[0].toISOString().slice(0,10);
         if (blockedSet.has(iso)) {
-          alert("That date is already booked. Please pick another date.");
+          alert("That date is already booked (interior day). Please pick another date.");
           instance.clear();
         }
       }
@@ -275,12 +272,12 @@ DEFAULT_TEMPLATES = {
       };
 
       pickers.forEach(el => {
-        // Ensure it's a text input for flatpickr (avoid native picker override)
+        // Ensure text type for Flatpickr (avoid native datepicker override)
         el.setAttribute("type","text");
         el._fp = flatpickr(el, opts);
       });
 
-      // Cross-field checks: end > start + range not overlapping blocked days
+      // Cross-field checks: end > start and interior overlap guard
       const s = document.querySelector("input[name='start_date']");
       const e = document.querySelector("input[name='end_date']");
       function enforceRange(){
@@ -295,22 +292,22 @@ DEFAULT_TEMPLATES = {
       if (s) s.addEventListener("change", enforceRange);
       if (e) e.addEventListener("change", enforceRange);
 
-      // Prevent submit if any day in [start, end] is blocked
+      // Prevent submit if any interior day in [start, end) is blocked
       const form = document.querySelector("form[data-validate='booking']");
       if (form) {
         form.addEventListener("submit", (evt) => {
           const sv = s && s.value ? new Date(s.value) : null;
           const ev = e && e.value ? new Date(e.value) : null;
-          if (!sv || !ev) return; // server will handle missing
+          if (!sv || !ev) return; // let server validate too
           if (ev <= sv) {
             alert("End date must be AFTER start date.");
             evt.preventDefault();
             return;
           }
-          // iterate dates
+          // iterate [start, end) -> no blocking on the end day
           let cur = new Date(s.value);
           const end = new Date(e.value);
-          while (cur <= end) {
+          while (cur < end) {
             const iso = cur.toISOString().slice(0,10);
             if (blockedSet.has(iso)) {
               alert("Your selection overlaps with an already booked date (" + iso + "). Please choose different dates.");
@@ -439,29 +436,13 @@ DEFAULT_TEMPLATES = {
 <h2>Pending Requests</h2>
 {% if pending %}
 <table role="grid">
-  <thead><tr><th>Member</th><th>Dates</th><th>Notes</th><th>Conflicts</th><th>Actions</th></tr></thead>
+  <thead><tr><th>Member</th><th>Dates</th><th>Notes</th><th>Actions</th></tr></thead>
   <tbody>
   {% for r in pending %}
     <tr>
       <td>{{ r.member.name }} ({{ r.member.member_type }})<br><small>{{ r.member.email }}</small></td>
       <td>{{ r.start_date }} → {{ r.end_date }}</td>
       <td>{{ r.notes }}</td>
-      <td>
-        {% set g = gcal_conf.get(r.id) %}
-        {% if g and g|length > 0 %}
-          <span class="badge">GCal conflict</span>
-          <details style="margin-top:0.25rem;">
-            <summary>details</summary>
-            <ul style="margin:0.25rem 0 0 1rem;">
-              {% for item in g %}
-                <li>{{ item }}</li>
-              {% endfor %}
-            </ul>
-          </details>
-        {% else %}
-          <span class="tag">none</span>
-        {% endif %}
-      </td>
       <td>
         <form method="POST" action="{{ url_for('approve_request', req_id=r.id) }}" style="display:inline;">
           <button>Approve</button>
@@ -555,7 +536,7 @@ def current_admin_email():
     return os.getenv("ADMIN_EMAIL") if is_admin() else None
 
 # -----------------------------
-# Email/SMS helpers + logging
+# Email/SMS helpers (DRY-RUN aware)
 # -----------------------------
 def send_email(to_email: str, subject: str, body: str) -> bool:
     host = os.getenv("SMTP_HOST")
@@ -671,7 +652,7 @@ def add_event_to_calendar(summary, start_date, end_date, description=""):
             "summary": summary,
             "description": description,
             "start": {"date": start_date.isoformat()},
-            "end": {"date": (end_date + timedelta(days=1)).isoformat()},
+            "end": {"date": (end_date + timedelta(days=1)).isoformat()},  # all-day, exclusive end
         }
         event = service.events().insert(calendarId=calendar_id, body=event_body).execute()
         print(f"[Calendar] Inserted event id={event.get('id')}")
@@ -697,10 +678,16 @@ def remove_event_from_calendar(event_id):
         return False
 
 # -----------------------------
-# Booking conflict helpers
+# Booking conflict helpers (END-EXCLUSIVE)
 # -----------------------------
 def ranges_overlap(a_start, a_end, b_start, b_end):
-    return not (a_end < b_start or b_end < a_start)
+    """
+    Treat end days as EXCLUSIVE so back-to-back bookings are allowed:
+    [a_start, a_end) overlaps [b_start, b_end)  <=>  not (a_end <= b_start or b_end <= a_start)
+    NOTE: we store end_date inclusive in DB, but we apply this logic directly to dates
+    so that equality at endpoints (a_end == b_start) is allowed (no overlap).
+    """
+    return not (a_end <= b_start or b_end <= a_start)
 
 def find_conflicts(start_date, end_date, exclude_request_id=None):
     q = BookingRequest.query.filter(BookingRequest.status == "approved")
@@ -851,7 +838,7 @@ def dashboard():
     return render_template("dashboard.html", me=m, upcoming=upcoming, pending=pending)
 
 # -----------------------------
-# Request form + aliases (client+server blocking)
+# Request form + aliases (client+server blocking, end-day allowed)
 # -----------------------------
 def _request_form_handler():
     me = current_member()
@@ -870,10 +857,10 @@ def _request_form_handler():
             flash("End date must be after start date.", "danger")
             return render_template("request.html", form=form)
 
-        # Server: hard-stop if any overlap with approved bookings
+        # Server: END-EXCLUSIVE overlap check
         overlaps = find_conflicts(form.start_date.data, form.end_date.data)
         if overlaps:
-            flash("Those dates include a day that is already booked. Please choose a different range.", "danger")
+            flash("Those dates overlap an existing booking. Note: end days are allowed to touch the next start day.", "danger")
             return render_template("request.html", form=form)
 
         # find or create member
@@ -900,7 +887,7 @@ def _request_form_handler():
         )
         db.session.add(br)
         db.session.commit()
-        _snapshot_booking(br)  # snapshot initial "pending")
+        _snapshot_booking(br)
 
         flash("Request submitted! You’ll receive an email confirmation.", "success")
         return redirect(url_for("dashboard") if current_member() else url_for("root"))
@@ -915,7 +902,7 @@ def request_booking():
 def request_new():
     return _request_form_handler()
 
-# Legacy aliases used in older templates
+# Legacy aliases for older templates
 @app.route("/request_booking", methods=["GET", "POST"])
 def request_booking_old():
     return _request_form_handler()
@@ -924,7 +911,7 @@ def request_booking_old():
 def request_new_old():
     return _request_form_handler()
 
-# Booked dates API for datepicker
+# Booked dates API for datepicker (INTERIOR DAYS ONLY: start .. end-1)
 @app.get("/api/booked-dates")
 def api_booked_dates():
     rows = (BookingRequest.query
@@ -934,7 +921,8 @@ def api_booked_dates():
     blocked = set()
     for s, e in rows:
         d = s
-        while d <= e:
+        # stop BEFORE e to allow back-to-back on the end day
+        while d < e:
             blocked.add(d.isoformat())
             d += timedelta(days=1)
     return jsonify(sorted(blocked))
@@ -984,7 +972,7 @@ def calendar_ics():
         uid = f"lakehouse-{r.id}@example.local"
         dtstamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         dtstart = r.start_date.strftime("%Y%m%d")
-        dtend = (r.end_date + timedelta(days=1)).strftime("%Y%m%d")
+        dtend = (r.end_date + timedelta(days=1)).strftime("%Y%m%d")  # exclusive end
         summary = esc(f"Lake House: {r.member.name} ({r.member.member_type})")
         desc = esc((r.notes or "") + f"\\nMember email: {r.member.email}")
         ev = [
@@ -1049,25 +1037,10 @@ def admin_requests():
                .order_by(BookingRequest.created_at.desc())
                .all())
 
-    gcal_conf = {}
-    try:
-        if GOOGLE_OK and os.getenv("GOOGLE_CALENDAR_ID"):
-            for r in pending:
-                try:
-                    # Optional conflict peek (non-blocking)
-                    gcal_conf[r.id] = []  # replace with real call if desired
-                except Exception as e:
-                    app.logger.warning(f"[gcal_conf] failed for req {r.id}: {e}")
-        else:
-            app.logger.info("[gcal_conf] skipped (no google libs or GOOGLE_CALENDAR_ID)")
-    except Exception as e:
-        app.logger.warning(f"[gcal_conf] top-level failure: {e}")
-
     return render_template(
         "admin_requests.html",
         pending=pending, approved=approved, denied=denied,
         logs=AuditLog.query.order_by(AuditLog.created_at.desc()).limit(50).all(),
-        gcal_conf=gcal_conf,
     )
 
 @app.post("/admin/requests/<int:req_id>/approve")
