@@ -1,4 +1,4 @@
-# app.py — Lake House bookings (Flatpickr calendar fixed, sign-out visible, end-day overlap allowed)
+# app.py — Lake House bookings (Flatpickr calendar fixed, local-date blocking, end-day overlap allowed)
 import os, sys, json, csv, socket
 from io import StringIO
 from pathlib import Path
@@ -163,7 +163,7 @@ class SignupForm(FlaskForm):
 # -----------------------------
 DEFAULT_TEMPLATES = {
     # include a version marker so we can detect/refresh if needed
-    "base.html": r"""<!-- LAKEHOUSE_BASE_V3 -->
+    "base.html": r"""<!-- LAKEHOUSE_BASE_V3A -->
 <!doctype html>
 <html lang="en">
 <head>
@@ -203,6 +203,7 @@ DEFAULT_TEMPLATES = {
         <li class="brand"><span class="dot"></span>Lake House Bookings</li>
       </ul>
       <ul>
+        <li><a href="{{ url_for('calendar_view') }}">Calendar</a></li>
         {% if session.get('user_member_id') %}
           <li><a href="{{ url_for('dashboard') }}">Dashboard</a></li>
           <li><a href="{{ url_for('request_booking') }}">New request</a></li>
@@ -240,6 +241,14 @@ DEFAULT_TEMPLATES = {
   <!-- Flatpickr -->
   <script src="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.js"></script>
   <script>
+    // format YYYY-MM-DD in LOCAL time (avoid UTC shift from toISOString)
+    function fmtLocal(d){
+      const y = d.getFullYear();
+      const m = String(d.getMonth()+1).padStart(2,"0");
+      const dd = String(d.getDate()).padStart(2,"0");
+      return y + "-" + m + "-" + dd;
+    }
+
     // Calendar initializer — blocks interior booked days, allows end-day overlap
     async function initLakeDatepickers() {
       const pickers = document.querySelectorAll("input.datepicker");
@@ -255,13 +264,12 @@ DEFAULT_TEMPLATES = {
       const blockedSet = new Set(blocked);
 
       function isBlocked(date){
-        const iso = date.toISOString().slice(0,10);
-        return blockedSet.has(iso);
+        return blockedSet.has(fmtLocal(date));
       }
 
       function onChangeCheck(selDates, _dateStr, instance){
         if (!selDates.length) return;
-        const iso = selDates[0].toISOString().slice(0,10);
+        const iso = fmtLocal(selDates[0]);
         if (blockedSet.has(iso)) {
           alert("That date is already booked (interior day). Please pick another date.");
           instance.clear();
@@ -286,8 +294,8 @@ DEFAULT_TEMPLATES = {
       const s = document.querySelector("input[name='start_date']");
       const e = document.querySelector("input[name='end_date']");
       function enforceRange(){
-        const sv = s && s.value ? new Date(s.value) : null;
-        const ev = e && e.value ? new Date(e.value) : null;
+        const sv = s && s.value ? new Date(s.value+"T00:00:00") : null;
+        const ev = e && e.value ? new Date(e.value+"T00:00:00") : null;
         if (sv && ev && ev <= sv) {
           alert("End date must be AFTER start date.");
           e.value = "";
@@ -301,18 +309,18 @@ DEFAULT_TEMPLATES = {
       const form = document.querySelector("form[data-validate='booking']");
       if (form) {
         form.addEventListener("submit", (evt) => {
-          const sv = s && s.value ? new Date(s.value) : null;
-          const ev = e && e.value ? new Date(e.value) : null;
+          const sv = s && s.value ? new Date(s.value+"T00:00:00") : null;
+          const ev = e && e.value ? new Date(e.value+"T00:00:00") : null;
           if (!sv || !ev) return; // server will also validate
           if (ev <= sv) {
             alert("End date must be AFTER start date.");
             evt.preventDefault();
             return;
           }
-          let cur = new Date(s.value);
-          const end = new Date(e.value);
+          let cur = new Date(sv);
+          const end = new Date(ev);
           while (cur < end) { // end-exclusive
-            const iso = cur.toISOString().slice(0,10);
+            const iso = fmtLocal(cur);
             if (blockedSet.has(iso)) {
               alert("Your selection overlaps with an already booked date (" + iso + "). Please choose different dates.");
               evt.preventDefault();
@@ -508,7 +516,7 @@ def _ensure_templates_present():
         force = os.getenv("FORCE_TEMPLATE_REFRESH", "0") == "1"
         for name, content in DEFAULT_TEMPLATES.items():
             p = TEMPLATES_DIR / name
-            if force or (not p.exists()) or ("LAKEHOUSE_BASE_V3" in content and "LAKEHOUSE_BASE_V3" not in (p.read_text(encoding="utf-8") if p.exists() else "")):
+            if force or (not p.exists()) or ("LAKEHOUSE_BASE_V3A" in content and "LAKEHOUSE_BASE_V3A" not in (p.read_text(encoding="utf-8") if p.exists() else "")):
                 p.write_text(content, encoding="utf-8")
                 app.logger.info(f"[bootstrap] wrote template: {p}")
     except Exception as e:
@@ -1150,6 +1158,11 @@ def export_requests_jsonl():
             "notes": r.notes,
         })
     return jsonify(out)
+
+# Favicon (avoid noisy 404s)
+@app.route("/favicon.ico")
+def favicon():
+    return ("", 204)
 
 # Friendly 404
 @app.errorhandler(404)
