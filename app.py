@@ -1,4 +1,4 @@
-# app.py — Lake House bookings (Flatpickr calendar fixed, sign-out visible, end-day overlap allowed + Calendar page link/template)
+# app.py — Lake House bookings (blocks user's own overlaps; creates/removes Google Calendar events; Calendar page + Flatpickr)
 import os, sys, json, csv, socket
 from io import StringIO
 from pathlib import Path
@@ -163,7 +163,7 @@ class SignupForm(FlaskForm):
 # -----------------------------
 DEFAULT_TEMPLATES = {
     # include a version marker so we can detect/refresh if needed
-    "base.html": r"""<!-- LAKEHOUSE_BASE_V5 -->
+    "base.html": r"""<!-- LAKEHOUSE_BASE_V6 -->
 <!doctype html>
 <html lang="en">
 <head>
@@ -246,30 +246,43 @@ DEFAULT_TEMPLATES = {
       const pad = n => String(n).padStart(2,'0');
       return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate());
     }
-    // Calendar initializer — blocks interior booked days, allows end-day overlap
+
+    // Calendar initializer — greys out CONFIRMED (approved) interior days;
+    // additionally warns & blocks if YOUR OWN (pending or approved) requests overlap
     async function initLakeDatepickers() {
       const pickers = document.querySelectorAll("input.datepicker");
       if (!pickers.length) return;
 
-      let blocked = [];
+      // 1) Confirmed/approved blocked days (greyed out)
+      let confirmedBlocked = [];
       try {
         const res = await fetch("{{ url_for('api_booked_dates') }}", {cache:"no-store"});
-        blocked = await res.json();
+        confirmedBlocked = await res.json();
       } catch (e) {
         console.warn("Failed to load blocked dates", e);
       }
-      const blockedSet = new Set(blocked);
+      const confirmedSet = new Set(confirmedBlocked);
 
-      function isBlocked(date){
+      // 2) Your own pending/approved blocked days (not greyed, but used to prevent submit)
+      let myBlocked = [];
+      try {
+        const res2 = await fetch("{{ url_for('api_my_blocked_dates') }}", {cache:"no-store"});
+        if (res2.ok) myBlocked = await res2.json();
+      } catch (e) {
+        console.warn("Failed to load my blocked dates", e);
+      }
+      const mySet = new Set(myBlocked);
+
+      function isConfirmedBlocked(date){
         const iso = fmtLocalYMD(date);
-        return blockedSet.has(iso);
+        return confirmedSet.has(iso);
       }
 
       function onChangeCheck(selDates, _dateStr, instance){
         if (!selDates.length) return;
         const iso = fmtLocalYMD(selDates[0]);
-        if (blockedSet.has(iso)) {
-          alert("That date is already booked (interior day). Please pick another date.");
+        if (confirmedSet.has(iso)) {
+          alert("That date is already booked. Please pick another date.");
           instance.clear();
         }
       }
@@ -277,18 +290,16 @@ DEFAULT_TEMPLATES = {
       const opts = {
         dateFormat: "Y-m-d",
         minDate: "today",
-        disable: [isBlocked],
+        disable: [isConfirmedBlocked], // only confirmed are greyed/disabled
         onChange: onChangeCheck
       };
 
       pickers.forEach(el => {
-        // Ensure text type for Flatpickr (avoid native datepicker override)
-        el.setAttribute("type","text");
-        // In case of server-side render, default or restore value is respected
+        el.setAttribute("type","text"); // ensure Flatpickr, not native date input
         el._fp = flatpickr(el, opts);
       });
 
-      // Cross-field checks: end > start and interior overlap guard
+      // Cross-field checks: end > start
       const s = document.querySelector("input[name='start_date']");
       const e = document.querySelector("input[name='end_date']");
       function enforceRange(){
@@ -303,7 +314,7 @@ DEFAULT_TEMPLATES = {
       if (s) s.addEventListener("change", enforceRange);
       if (e) e.addEventListener("change", enforceRange);
 
-      // Prevent submit if any interior day in [start, end) is blocked
+      // Prevent submit if any interior day in [start, end) conflicts
       const form = document.querySelector("form[data-validate='booking']");
       if (form) {
         form.addEventListener("submit", (evt) => {
@@ -318,8 +329,14 @@ DEFAULT_TEMPLATES = {
           let cur = new Date(s.value);
           const end = new Date(e.value);
           while (cur < end) { // end-exclusive
-            if (blockedSet.has(fmtLocalYMD(cur))) {
-              alert("Your selection overlaps with an already booked date (" + fmtLocalYMD(cur) + "). Please choose different dates.");
+            const iso = fmtLocalYMD(cur);
+            if (confirmedSet.has(iso)) {
+              alert("Your selection overlaps with a confirmed booking (" + iso + "). Please choose different dates.");
+              evt.preventDefault();
+              return;
+            }
+            if (mySet.has(iso)) {
+              alert("You already have a request that includes " + iso + ". Please choose dates that don't overlap your own request.");
               evt.preventDefault();
               return;
             }
@@ -502,7 +519,6 @@ DEFAULT_TEMPLATES = {
 {% endif %}
 {% endblock %}""",
 
-    # NEW dedicated calendar template
     "calendar.html": r"""{% extends "base.html" %}
 {% block content %}
   <h2>Lake House Calendar</h2>
@@ -526,8 +542,7 @@ def _ensure_templates_present():
         force = os.getenv("FORCE_TEMPLATE_REFRESH", "0") == "1"
         for name, content in DEFAULT_TEMPLATES.items():
             p = TEMPLATES_DIR / name
-            # Overwrite if forcing, if file missing, or if our V5 marker isn't present yet
-            if force or (not p.exists()) or ("LAKEHOUSE_BASE_V5" in content and "LAKEHOUSE_BASE_V5" not in (p.read_text(encoding="utf-8") if p.exists() else "")):
+            if force or (not p.exists()) or ("LAKEHOUSE_BASE_V6" in content and "LAKEHOUSE_BASE_V6" not in (p.read_text(encoding="utf-8") if p.exists() else "")):
                 p.write_text(content, encoding="utf-8")
                 app.logger.info(f"[bootstrap] wrote template: {p}")
     except Exception as e:
@@ -714,6 +729,18 @@ def find_conflicts(start_date, end_date, exclude_request_id=None):
         q = q.filter(BookingRequest.id != exclude_request_id)
     return [r for r in q.all() if ranges_overlap(start_date, end_date, r.start_date, r.end_date)]
 
+def find_member_conflicts(member_id, start_date, end_date, exclude_request_id=None):
+    """
+    Overlaps with THIS member's own requests that are pending or approved.
+    """
+    q = BookingRequest.query.filter(
+        BookingRequest.member_id == member_id,
+        BookingRequest.status.in_(("pending", "approved"))
+    )
+    if exclude_request_id:
+        q = q.filter(BookingRequest.id != exclude_request_id)
+    return [r for r in q.all() if ranges_overlap(start_date, end_date, r.start_date, r.end_date)]
+
 def _log(action, request_id, details=""):
     db.session.add(AuditLog(action=action, request_id=request_id, admin_email=current_admin_email(), details=details))
     db.session.commit()
@@ -876,14 +903,23 @@ def _request_form_handler():
             flash("End date must be after start date.", "danger")
             return render_template("request.html", form=form)
 
-        # Server: END-EXCLUSIVE overlap check
+        # Identify the member (existing or newly created)
+        member = me or Member.query.filter_by(email=form.email.data.strip().lower()).first()
+
+        # If member exists, block overlaps with THEIR OWN pending/approved requests (end-exclusive)
+        if member:
+            own_overlaps = find_member_conflicts(member.id, form.start_date.data, form.end_date.data)
+            if own_overlaps:
+                flash("These dates overlap one of your own requests. Back-to-back is allowed, but no interior overlap.", "danger")
+                return render_template("request.html", form=form)
+
+        # Server: END-EXCLUSIVE overlap check vs approved requests (any member)
         overlaps = find_conflicts(form.start_date.data, form.end_date.data)
         if overlaps:
-            flash("Those dates overlap an existing booking. Note: end days are allowed to touch the next start day.", "danger")
+            flash("Those dates overlap an existing approved booking. Note: end days are allowed to touch the next start day.", "danger")
             return render_template("request.html", form=form)
 
-        # find or create member
-        member = me or Member.query.filter_by(email=form.email.data.strip().lower()).first()
+        # Create or update member record as needed
         if not member:
             member = Member(
                 name=form.name.data.strip(),
@@ -931,7 +967,7 @@ def request_booking_old():
 def request_new_old():
     return _request_form_handler()
 
-# Booked dates API for datepicker (INTERIOR DAYS ONLY: start .. end-1)
+# Booked dates API for datepicker (INTERIOR DAYS ONLY: start .. end-1) — CONFIRMED/APPROVED ONLY
 @app.get("/api/booked-dates")
 def api_booked_dates():
     rows = (BookingRequest.query
@@ -942,6 +978,25 @@ def api_booked_dates():
     for s, e in rows:
         d = s
         while d < e:  # stop BEFORE e so end-day is free for back-to-back bookings
+            blocked.add(d.isoformat())
+            d += timedelta(days=1)
+    return jsonify(sorted(blocked))
+
+# Your own blocked dates (pending or approved) for client-side warning (not greyed)
+@app.get("/api/my-blocked-dates")
+def api_my_blocked_dates():
+    m = current_member()
+    if not m:
+        return jsonify([])  # not signed in: nothing to warn about
+    rows = (BookingRequest.query
+            .filter(BookingRequest.member_id == m.id,
+                    BookingRequest.status.in_(("pending", "approved")))
+            .with_entities(BookingRequest.start_date, BookingRequest.end_date)
+            .all())
+    blocked = set()
+    for s, e in rows:
+        d = s
+        while d < e:  # end-exclusive
             blocked.add(d.isoformat())
             d += timedelta(days=1)
     return jsonify(sorted(blocked))
@@ -1065,8 +1120,21 @@ def approve_request(req_id):
         flash(f"Cannot approve: date conflict with {conflict_list}.", "danger")
         return redirect(url_for("admin_requests"))
 
+    # Approve
     br.status = "approved"
     db.session.commit()
+
+    # Create Google Calendar event on approval
+    summary = f"Lake House: {br.member.name} ({br.member.member_type})"
+    description = (br.notes or "") + f"\nMember email: {br.member.email}"
+    ev_id = add_event_to_calendar(summary, br.start_date, br.end_date, description)
+    if ev_id:
+        br.calendar_event_id = ev_id
+        db.session.commit()
+        _tx("gcal.insert", "success", booking=br, member=br.member, target=ev_id, meta={"summary": summary})
+    else:
+        _tx("gcal.insert", "error", booking=br, member=br.member, target="", meta={"reason": "insert failed"})
+
     _snapshot_booking(br)
     _notify_status(br)
     _log("approve", br.id, "Approved")
@@ -1078,6 +1146,14 @@ def deny_request(req_id):
     if not is_admin():
         return redirect(url_for("admin_login"))
     br = BookingRequest.query.get_or_404(req_id)
+
+    # If it had a calendar event, remove it
+    if br.calendar_event_id:
+        ok = remove_event_from_calendar(br.calendar_event_id)
+        _tx("gcal.delete", "success" if ok else "error", booking=br, member=br.member, target=br.calendar_event_id)
+        if ok:
+            br.calendar_event_id = None
+
     br.status = "denied"
     db.session.commit()
     _snapshot_booking(br)
@@ -1091,6 +1167,14 @@ def cancel_request(req_id):
     if not is_admin():
         return redirect(url_for("admin_login"))
     br = BookingRequest.query.get_or_404(req_id)
+
+    # If it had a calendar event, remove it
+    if br.calendar_event_id:
+        ok = remove_event_from_calendar(br.calendar_event_id)
+        _tx("gcal.delete", "success" if ok else "error", booking=br, member=br.member, target=br.calendar_event_id)
+        if ok:
+            br.calendar_event_id = None
+
     br.status = "cancelled"
     db.session.commit()
     _snapshot_booking(br)
