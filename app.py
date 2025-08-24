@@ -1,4 +1,4 @@
-# app.py — Lake House bookings (Flatpickr tz-safe, self-overlap guard, end-day overlap allowed)
+# app.py — Lake House bookings (Flatpickr calendar fixed, sign-out visible, end-day overlap allowed + Calendar page link/template)
 import os, sys, json, csv, socket
 from io import StringIO
 from pathlib import Path
@@ -16,7 +16,7 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_wtf import FlaskForm
 from wtforms import StringField, SelectField, DateField, TextAreaField, SubmitField, BooleanField, PasswordField
 from wtforms.validators import DataRequired, Email, Length
-from sqlalchemy import case, text, and_, or_
+from sqlalchemy import case, text
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # Notifications (SMTP)
@@ -74,7 +74,7 @@ class BookingRequest(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     member_id = db.Column(db.Integer, db.ForeignKey('member.id'), nullable=False)
     start_date = db.Column(db.Date, nullable=False)
-    end_date = db.Column(db.Date, nullable=False)  # treated as END-EXCLUSIVE in logic
+    end_date = db.Column(db.Date, nullable=False)  # stored as inclusive, but we TREAT end-day as exclusive in logic
     notes = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     status = db.Column(db.String(16), nullable=False, default="pending")  # pending/approved/denied/cancelled
@@ -84,7 +84,7 @@ class BookingRequest(db.Model):
 
 class AuditLog(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    action = db.Column(db.String(32), nullable=False)
+    action = db.Column(db.String(32), nullable=False)  # approve/deny/cancel/create
     request_id = db.Column(db.Integer, db.ForeignKey('booking_request.id'), nullable=True)
     admin_email = db.Column(db.String(255), nullable=True)
     details = db.Column(db.Text, nullable=True)
@@ -117,6 +117,7 @@ class BookingRequestHistory(db.Model):
     end_date = db.Column(db.Date, nullable=False)
     notes = db.Column(db.Text)
     calendar_event_id = db.Column(db.String(128))
+
     booking_request = db.relationship("BookingRequest", lazy=True)
 
 # -----------------------------
@@ -130,6 +131,7 @@ class RequestForm(FlaskForm):
         ("due", "Due-paying member"),
         ("non_due", "Non due-paying member")
     ], validators=[DataRequired()])
+    # We'll force these to text inputs in the template so Flatpickr renders
     start_date = DateField("Start Date", validators=[DataRequired()], format="%Y-%m-%d")
     end_date = DateField("End Date", validators=[DataRequired()], format="%Y-%m-%d")
     notes = TextAreaField("Notes (optional)")
@@ -160,7 +162,8 @@ class SignupForm(FlaskForm):
 # Self-healing templates (Flatpickr + modern summer lake vibe)
 # -----------------------------
 DEFAULT_TEMPLATES = {
-    "base.html": r"""<!-- LAKEHOUSE_BASE_V4 -->
+    # include a version marker so we can detect/refresh if needed
+    "base.html": r"""<!-- LAKEHOUSE_BASE_V5 -->
 <!doctype html>
 <html lang="en">
 <head>
@@ -171,27 +174,36 @@ DEFAULT_TEMPLATES = {
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
 
   <style>
-    :root{ --lake-blue:#3aa4c4; --pine:#1b3a3a; --sand:#f9f6ef; --sun:#ffd166; --text:#0f172a; }
+    :root{
+      --lake-blue:#3aa4c4; --pine:#1b3a3a; --sand:#f9f6ef; --sun:#ffd166; --text:#0f172a;
+    }
     body{ background: linear-gradient(180deg, var(--sand) 0%, #ffffff 80%); color: var(--text); }
-    nav{ background: linear-gradient(90deg, var(--lake-blue), #7fd3e7); border-radius: 16px; padding:.75rem 1rem; }
+    nav{ background: linear-gradient(90deg, var(--lake-blue), #7fd3e7); border-radius: 16px; padding: .75rem 1rem; }
     nav a{ color:#083344; font-weight:600; }
     .brand{ display:flex; gap:.5rem; align-items:center; font-weight:800; color:#053b4a;}
     .brand .dot{ width:10px; height:10px; border-radius:999px; background:var(--sun); box-shadow:0 0 0 4px rgba(255,209,102,.35);}
-    .card{ border-radius:16px; box-shadow:0 8px 24px rgba(0,0,0,.06); }
-    .btn-primary{ background:var(--lake-blue); border:none; }
+    .card{ border-radius: 16px; box-shadow: 0 8px 24px rgba(0,0,0,.06); }
+    .btn-primary{ background: var(--lake-blue); border:none; }
     .badge{ padding:.2rem .45rem; border-radius:999px; font-size:.75rem; background:#e2f6fb; color:#0b4a5a; }
     .tag{ padding:.15rem .4rem; border-radius:999px; background:#eef2f7; color:#475569; font-size:.75rem;}
     footer{ color:#64748b; font-size:.9rem; }
-    .flatpickr-day.disabled, .flatpickr-day.disabled:hover{
-      background:#f1f5f9; color:#94a3b8 !important; cursor:not-allowed; text-decoration:line-through;
+    .flatpickr-day.disabled,
+    .flatpickr-day.disabled:hover{
+      background:#f1f5f9;
+      color:#94a3b8 !important;
+      cursor:not-allowed;
+      text-decoration: line-through;
     }
   </style>
 </head>
 <body>
   <main class="container">
     <nav>
-      <ul><li class="brand"><span class="dot"></span>Lake House Bookings</li></ul>
       <ul>
+        <li class="brand"><span class="dot"></span>Lake House Bookings</li>
+      </ul>
+      <ul>
+        <li><a href="{{ url_for('calendar_view') }}">Calendar</a></li>
         {% if session.get('user_member_id') %}
           <li><a href="{{ url_for('dashboard') }}">Dashboard</a></li>
           <li><a href="{{ url_for('request_booking') }}">New request</a></li>
@@ -221,18 +233,19 @@ DEFAULT_TEMPLATES = {
 
     {% block content %}{% endblock %}
 
-    <footer style="margin-top:3rem">Built with Flask • Conflict detection • ICS feed • Accounts</footer>
+    <footer style="margin-top:3rem">
+      Built with Flask • Conflict detection • ICS feed • Accounts
+    </footer>
   </main>
 
   <!-- Flatpickr -->
   <script src="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.js"></script>
   <script>
-    // Format a JS Date as YYYY-MM-DD in LOCAL time (avoid UTC shift).
+    // format a Date using local timezone (avoid UTC off-by-one)
     function fmtLocalYMD(d){
-      const p=n=>String(n).padStart(2,'0');
-      return d.getFullYear()+"-"+p(d.getMonth()+1)+"-"+p(d.getDate());
+      const pad = n => String(n).padStart(2,'0');
+      return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate());
     }
-
     // Calendar initializer — blocks interior booked days, allows end-day overlap
     async function initLakeDatepickers() {
       const pickers = document.querySelectorAll("input.datepicker");
@@ -242,10 +255,15 @@ DEFAULT_TEMPLATES = {
       try {
         const res = await fetch("{{ url_for('api_booked_dates') }}", {cache:"no-store"});
         blocked = await res.json();
-      } catch(e){ console.warn("Failed to load blocked dates", e); }
+      } catch (e) {
+        console.warn("Failed to load blocked dates", e);
+      }
       const blockedSet = new Set(blocked);
 
-      function isBlocked(date){ return blockedSet.has(fmtLocalYMD(date)); }
+      function isBlocked(date){
+        const iso = fmtLocalYMD(date);
+        return blockedSet.has(iso);
+      }
 
       function onChangeCheck(selDates, _dateStr, instance){
         if (!selDates.length) return;
@@ -264,11 +282,13 @@ DEFAULT_TEMPLATES = {
       };
 
       pickers.forEach(el => {
-        el.setAttribute("type","text"); // ensure Flatpickr, not native date input
+        // Ensure text type for Flatpickr (avoid native datepicker override)
+        el.setAttribute("type","text");
+        // In case of server-side render, default or restore value is respected
         el._fp = flatpickr(el, opts);
       });
 
-      // Cross-field checks: end > start and interior overlap guard (end-exclusive)
+      // Cross-field checks: end > start and interior overlap guard
       const s = document.querySelector("input[name='start_date']");
       const e = document.querySelector("input[name='end_date']");
       function enforceRange(){
@@ -289,7 +309,7 @@ DEFAULT_TEMPLATES = {
         form.addEventListener("submit", (evt) => {
           const sv = s && s.value ? new Date(s.value) : null;
           const ev = e && e.value ? new Date(e.value) : null;
-          if (!sv || !ev) return; // server validates too
+          if (!sv || !ev) return; // server will also validate
           if (ev <= sv) {
             alert("End date must be AFTER start date.");
             evt.preventDefault();
@@ -481,15 +501,33 @@ DEFAULT_TEMPLATES = {
 <p>No denied requests.</p>
 {% endif %}
 {% endblock %}""",
+
+    # NEW dedicated calendar template
+    "calendar.html": r"""{% extends "base.html" %}
+{% block content %}
+  <h2>Lake House Calendar</h2>
+  {% if embed_src %}
+    <iframe src="{{ embed_src }}" style="border:0; width:100%; height:75vh;" frameborder="0" scrolling="no"></iframe>
+    <p style="margin-top:0.75rem;">Need an ICS? <a href="{{ url_for('calendar_ics') }}">Subscribe to the iCal feed</a>.</p>
+  {% else %}
+    <article class="warning"><strong>Calendar not configured.</strong>
+    <p>Set <code>GOOGLE_CALENDAR_EMBED_ID</code> (recommended) or <code>GOOGLE_CALENDAR_ID</code> in Render, then redeploy.</p></article>
+  {% endif %}
+{% endblock %}""",
 }
 
 def _ensure_templates_present():
+    """
+    Write templates if missing; optionally force refresh with FORCE_TEMPLATE_REFRESH=1
+    or if the version marker is missing.
+    """
     try:
         TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
         force = os.getenv("FORCE_TEMPLATE_REFRESH", "0") == "1"
         for name, content in DEFAULT_TEMPLATES.items():
             p = TEMPLATES_DIR / name
-            if force or (not p.exists()) or ("LAKEHOUSE_BASE_V4" in content and "LAKEHOUSE_BASE_V4" not in (p.read_text(encoding="utf-8") if p.exists() else "")):
+            # Overwrite if forcing, if file missing, or if our V5 marker isn't present yet
+            if force or (not p.exists()) or ("LAKEHOUSE_BASE_V5" in content and "LAKEHOUSE_BASE_V5" not in (p.read_text(encoding="utf-8") if p.exists() else "")):
                 p.write_text(content, encoding="utf-8")
                 app.logger.info(f"[bootstrap] wrote template: {p}")
     except Exception as e:
@@ -670,21 +708,8 @@ def ranges_overlap(a_start, a_end, b_start, b_end):
     """
     return not (a_end <= b_start or b_end <= a_start)
 
-def find_conflicts_global(start_date, end_date, exclude_request_id=None):
-    """Overlaps with any APPROVED booking (anyone)."""
+def find_conflicts(start_date, end_date, exclude_request_id=None):
     q = BookingRequest.query.filter(BookingRequest.status == "approved")
-    if exclude_request_id:
-        q = q.filter(BookingRequest.id != exclude_request_id)
-    return [r for r in q.all() if ranges_overlap(start_date, end_date, r.start_date, r.end_date)]
-
-def find_conflicts_self(start_date, end_date, member_id, exclude_request_id=None):
-    """Overlaps with THIS MEMBER's own pending/approved bookings."""
-    if not member_id:
-        return []
-    q = BookingRequest.query.filter(
-        BookingRequest.member_id == member_id,
-        BookingRequest.status.in_(["approved", "pending"])
-    )
     if exclude_request_id:
         q = q.filter(BookingRequest.id != exclude_request_id)
     return [r for r in q.all() if ranges_overlap(start_date, end_date, r.start_date, r.end_date)]
@@ -851,30 +876,18 @@ def _request_form_handler():
             flash("End date must be after start date.", "danger")
             return render_template("request.html", form=form)
 
-        # Who is this request for (needed for self-overlap check)?
-        email = form.email.data.strip().lower()
-        existing_member = me or Member.query.filter_by(email=email).first()
-        existing_member_id = existing_member.id if existing_member else None
-
-        # 1) Global conflicts (any APPROVED)
-        conflicts = find_conflicts_global(form.start_date.data, form.end_date.data)
-        if conflicts:
-            flash("Those dates overlap an existing approved booking. Note: end days are allowed to touch the next start day.", "danger")
+        # Server: END-EXCLUSIVE overlap check
+        overlaps = find_conflicts(form.start_date.data, form.end_date.data)
+        if overlaps:
+            flash("Those dates overlap an existing booking. Note: end days are allowed to touch the next start day.", "danger")
             return render_template("request.html", form=form)
 
-        # 2) Self conflicts (this member's own PENDING/APPROVED)
-        if existing_member_id:
-            self_conf = find_conflicts_self(form.start_date.data, form.end_date.data, existing_member_id)
-            if self_conf:
-                flash("Those dates overlap one of your own existing requests/bookings.", "danger")
-                return render_template("request.html", form=form)
-
-        # find or create member record
-        member = existing_member
+        # find or create member
+        member = me or Member.query.filter_by(email=form.email.data.strip().lower()).first()
         if not member:
             member = Member(
                 name=form.name.data.strip(),
-                email=email,
+                email=form.email.data.strip().lower(),
                 phone=(form.phone.data.strip() if form.phone.data else None),
                 member_type=form.member_type.data,
             )
@@ -898,6 +911,7 @@ def _request_form_handler():
         flash("Request submitted! You’ll receive an email confirmation.", "success")
         return redirect(url_for("dashboard") if current_member() else url_for("root"))
 
+    # IMPORTANT: ensure the rendered inputs are text + class=datepicker (see template)
     return render_template("request.html", form=form)
 
 @app.route("/request", methods=["GET", "POST"])
@@ -908,7 +922,7 @@ def request_booking():
 def request_new():
     return _request_form_handler()
 
-# Backward-compat aliases
+# Backward-compat aliases (in case templates link differently)
 @app.route("/request_booking", methods=["GET", "POST"])
 def request_booking_old():
     return _request_form_handler()
@@ -944,16 +958,7 @@ def calendar_view():
             "https://calendar.google.com/calendar/embed"
             f"?src={quote(cal_id)}&ctz=America%2FNew_York&mode=MONTH&showPrint=0&showTitle=0"
         )
-    return render_template_string("""{% extends "base.html" %}{% block content %}
-    <h2>Lake House Calendar</h2>
-    {% if embed_src %}
-      <iframe src="{{ embed_src }}" style="border:0; width:100%; height:75vh;" frameborder="0" scrolling="no"></iframe>
-      <p style="margin-top:0.75rem;">Need an ICS? <a href="{{ url_for('calendar_ics') }}">Subscribe to the iCal feed</a>.</p>
-    {% else %}
-      <article class="warning"><strong>Calendar not configured.</strong>
-      <p>Set <code>GOOGLE_CALENDAR_EMBED_ID</code> (recommended) or <code>GOOGLE_CALENDAR_ID</code> in Render, then redeploy.</p></article>
-    {% endif %}
-    {% endblock %}""", embed_src=embed_src)
+    return render_template("calendar.html", embed_src=embed_src)
 
 @app.route("/calendar.ics")
 def calendar_ics():
@@ -1054,8 +1059,7 @@ def approve_request(req_id):
         return redirect(url_for("admin_login"))
     br = BookingRequest.query.get_or_404(req_id)
 
-    # Guard again at approval time (end-exclusive)
-    conflicts = find_conflicts_global(br.start_date, br.end_date, exclude_request_id=br.id)
+    conflicts = find_conflicts(br.start_date, br.end_date, exclude_request_id=br.id)
     if conflicts:
         conflict_list = ", ".join(f"{c.member.name}({c.start_date}→{c.end_date})" for c in conflicts)
         flash(f"Cannot approve: date conflict with {conflict_list}.", "danger")
