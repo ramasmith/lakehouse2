@@ -1,6 +1,4 @@
-Here’s a full, ready-to-paste `app.py` that builds on your file and wires in **user receipt emails** on request submission and **admin alert emails** on new requests and admin actions (approve/deny/cancel). It also logs those notifications in `data_transaction` for auditability. SMS alerts are still optional (DRY-RUN unless Twilio env vars are set) and will be sent to the user if they checked “Send me SMS updates,” and to an admin number if `TWILIO_ADMIN_NUMBER` is set.
 
-```python
 # app.py — Lake House bookings (blocks user's own overlaps; creates/removes Google Calendar events; Calendar page + Flatpickr; user receipts + admin alerts)
 import os, sys, json, csv, socket
 from io import StringIO
