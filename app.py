@@ -1,4 +1,7 @@
-# app.py — Lake House bookings (blocks user's own overlaps; creates/removes Google Calendar events; Calendar page + Flatpickr)
+Here’s a full, ready-to-paste `app.py` that builds on your file and wires in **user receipt emails** on request submission and **admin alert emails** on new requests and admin actions (approve/deny/cancel). It also logs those notifications in `data_transaction` for auditability. SMS alerts are still optional (DRY-RUN unless Twilio env vars are set) and will be sent to the user if they checked “Send me SMS updates,” and to an admin number if `TWILIO_ADMIN_NUMBER` is set.
+
+```python
+# app.py — Lake House bookings (blocks user's own overlaps; creates/removes Google Calendar events; Calendar page + Flatpickr; user receipts + admin alerts)
 import os, sys, json, csv, socket
 from io import StringIO
 from pathlib import Path
@@ -649,6 +652,21 @@ def _tx(kind, status, booking=None, member=None, target=None, meta=None):
     except Exception as e:
         print(f"[TX-LOG ERROR] {e!r}")
 
+def send_and_log_email(to_email: str, subject: str, body: str, *, kind: str, booking=None, member=None):
+    ok = send_email(to_email, subject, body)
+    _tx("email", "success" if ok else "error", booking=booking, member=member, target=to_email, meta={"subject": subject, "kind": kind})
+    return ok
+
+def send_admin_alert(subject: str, body: str, *, booking=None, member=None):
+    admin_email = os.getenv("ADMIN_EMAIL")
+    if admin_email:
+        send_and_log_email(admin_email, subject, body, kind="admin.alert", booking=booking, member=member)
+    # Optional SMS to admin, if configured
+    admin_sms = os.getenv("TWILIO_ADMIN_NUMBER")
+    if admin_sms:
+        ok = send_sms(admin_sms, f"{subject}\n{body}")
+        _tx("sms", "success" if ok else "error", booking=booking, member=member, target=admin_sms, meta={"kind":"admin.alert"})
+
 # -----------------------------
 # Optional Google Calendar helpers
 # -----------------------------
@@ -769,7 +787,7 @@ def _notify_status(br: BookingRequest):
         body += "\nWe added it to the lake house calendar."
     elif br.status == "denied":
         body += "\nPlease contact the admin with any questions."
-    send_email(member.email, subj, body)
+    send_and_log_email(member.email, subj, body, kind=f"user.status.{br.status}", booking=br, member=member)
 
 # -----------------------------
 # Ensure DB + indexes (Render-safe)
@@ -943,6 +961,39 @@ def _request_form_handler():
         db.session.add(br)
         db.session.commit()
         _snapshot_booking(br)
+
+        # -------- NEW: User receipt email (+ optional SMS) --------
+        receipt_subj = f"We received your Lake House request (pending): {br.start_date} → {br.end_date}"
+        receipt_body = (
+            f"Hi {member.name},\n\n"
+            f"Thanks for your request for the Lake House from {br.start_date} to {br.end_date}.\n"
+            f"Status: PENDING\n\n"
+            f"Notes: {br.notes or '-'}\n\n"
+            f"Reminder: end-days are treated as exclusive, so back-to-back stays are allowed.\n"
+            f"We'll email you once an admin reviews your request."
+        )
+        send_and_log_email(member.email, receipt_subj, receipt_body, kind="user.receipt", booking=br, member=member)
+
+        if form.subscribe_sms.data and member.phone:
+            sms_ok = send_sms(member.phone, f"Lake House: request received for {br.start_date}→{br.end_date} (pending). We'll email updates.")
+            _tx("sms", "success" if sms_ok else "error", booking=br, member=member, target=member.phone, meta={"kind":"user.receipt"})
+
+        # -------- NEW: Admin alert on new request --------
+        admin_body = (
+            f"New booking request submitted.\n\n"
+            f"Member: {member.name} ({member.member_type})\n"
+            f"Email: {member.email}\n"
+            f"Phone: {member.phone or '-'}\n"
+            f"Dates: {br.start_date} → {br.end_date}\n"
+            f"Notes: {br.notes or '-'}\n\n"
+            f"Review at /admin/requests"
+        )
+        send_admin_alert(
+            subject=f"[Lake House] New request: {member.name} {br.start_date}→{br.end_date}",
+            body=admin_body,
+            booking=br,
+            member=member
+        )
 
         flash("Request submitted! You’ll receive an email confirmation.", "success")
         return redirect(url_for("dashboard") if current_member() else url_for("root"))
@@ -1134,10 +1185,29 @@ def approve_request(req_id):
         _tx("gcal.insert", "success", booking=br, member=br.member, target=ev_id, meta={"summary": summary})
     else:
         _tx("gcal.insert", "error", booking=br, member=br.member, target="", meta={"reason": "insert failed"})
+        # NEW: admin alert if calendar insert failed
+        send_admin_alert(
+            subject=f"[Lake House] Calendar insert FAILED for approval: {br.member.name} {br.start_date}→{br.end_date}",
+            body=f"Tried to insert a Google Calendar event but failed.\nRequest ID: {br.id}\nMember: {br.member.name}\nDates: {br.start_date}→{br.end_date}\nNotes: {br.notes or '-'}",
+            booking=br,
+            member=br.member
+        )
 
     _snapshot_booking(br)
     _notify_status(br)
     _log("approve", br.id, "Approved")
+
+    # NEW: admin alert on approved
+    send_admin_alert(
+        subject=f"[Lake House] Approved: {br.member.name} {br.start_date}→{br.end_date}",
+        body=(f"Approved booking.\nRequest ID: {br.id}\n"
+              f"Member: {br.member.name} ({br.member.member_type})\n"
+              f"Dates: {br.start_date}→{br.end_date}\n"
+              f"Calendar event: {br.calendar_event_id or '—'}"),
+        booking=br,
+        member=br.member
+    )
+
     flash("Request approved.", "success")
     return redirect(url_for("admin_requests"))
 
@@ -1159,6 +1229,17 @@ def deny_request(req_id):
     _snapshot_booking(br)
     _notify_status(br)
     _log("deny", br.id, "Denied by admin")
+
+    # NEW: admin alert on denied
+    send_admin_alert(
+        subject=f"[Lake House] Denied: {br.member.name} {br.start_date}→{br.end_date}",
+        body=(f"Denied booking.\nRequest ID: {br.id}\n"
+              f"Member: {br.member.name} ({br.member.member_type})\n"
+              f"Dates: {br.start_date}→{br.end_date}\nNotes: {br.notes or '—'}"),
+        booking=br,
+        member=br.member
+    )
+
     flash("Request denied.", "info")
     return redirect(url_for("admin_requests"))
 
@@ -1180,6 +1261,17 @@ def cancel_request(req_id):
     _snapshot_booking(br)
     _notify_status(br)
     _log("cancel", br.id, "Cancelled by admin")
+
+    # NEW: admin alert on cancelled
+    send_admin_alert(
+        subject=f"[Lake House] Cancelled: {br.member.name} {br.start_date}→{br.end_date}",
+        body=(f"Cancelled booking.\nRequest ID: {br.id}\n"
+              f"Member: {br.member.name} ({br.member.member_type})\n"
+              f"Dates: {br.start_date}→{br.end_date}"),
+        booking=br,
+        member=br.member
+    )
+
     flash("Request cancelled.", "warning")
     return redirect(url_for("admin_requests"))
 
@@ -1289,3 +1381,4 @@ if __name__ == "__main__":
     with app.app_context():
         db.create_all()
     app.run(host="0.0.0.0", port=5000)
+```
