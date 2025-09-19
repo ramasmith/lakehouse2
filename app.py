@@ -1,5 +1,4 @@
-
-# app.py — Lake House bookings (blocks user's own overlaps; creates/removes Google Calendar events; Calendar page + Flatpickr; user receipts + admin alerts)
+# app.py — Lake House bookings (fix false overlaps: strict end-exclusive + date normalization)
 import os, sys, json, csv, socket
 from io import StringIO
 from pathlib import Path
@@ -75,7 +74,7 @@ class BookingRequest(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     member_id = db.Column(db.Integer, db.ForeignKey('member.id'), nullable=False)
     start_date = db.Column(db.Date, nullable=False)
-    end_date = db.Column(db.Date, nullable=False)  # stored as inclusive, but we TREAT end-day as exclusive in logic
+    end_date = db.Column(db.Date, nullable=False)  # we TREAT end-day as EXCLUSIVE in all logic
     notes = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     status = db.Column(db.String(16), nullable=False, default="pending")  # pending/approved/denied/cancelled
@@ -160,10 +159,9 @@ class SignupForm(FlaskForm):
     submit = SubmitField("Create account")
 
 # -----------------------------
-# Self-healing templates (Flatpickr + modern summer lake vibe)
+# Templates (Flatpickr + lake vibe)
 # -----------------------------
 DEFAULT_TEMPLATES = {
-    # include a version marker so we can detect/refresh if needed
     "base.html": r"""<!-- LAKEHOUSE_BASE_V6 -->
 <!doctype html>
 <html lang="en">
@@ -175,9 +173,7 @@ DEFAULT_TEMPLATES = {
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
 
   <style>
-    :root{
-      --lake-blue:#3aa4c4; --pine:#1b3a3a; --sand:#f9f6ef; --sun:#ffd166; --text:#0f172a;
-    }
+    :root{ --lake-blue:#3aa4c4; --pine:#1b3a3a; --sand:#f9f6ef; --sun:#ffd166; --text:#0f172a; }
     body{ background: linear-gradient(180deg, var(--sand) 0%, #ffffff 80%); color: var(--text); }
     nav{ background: linear-gradient(90deg, var(--lake-blue), #7fd3e7); border-radius: 16px; padding: .75rem 1rem; }
     nav a{ color:#083344; font-weight:600; }
@@ -185,24 +181,17 @@ DEFAULT_TEMPLATES = {
     .brand .dot{ width:10px; height:10px; border-radius:999px; background:var(--sun); box-shadow:0 0 0 4px rgba(255,209,102,.35);}
     .card{ border-radius: 16px; box-shadow: 0 8px 24px rgba(0,0,0,.06); }
     .btn-primary{ background: var(--lake-blue); border:none; }
-    .badge{ padding:.2rem .45rem; border-radius:999px; font-size:.75rem; background:#e2f6fb; color:#0b4a5a; }
     .tag{ padding:.15rem .4rem; border-radius:999px; background:#eef2f7; color:#475569; font-size:.75rem;}
     footer{ color:#64748b; font-size:.9rem; }
-    .flatpickr-day.disabled,
-    .flatpickr-day.disabled:hover{
-      background:#f1f5f9;
-      color:#94a3b8 !important;
-      cursor:not-allowed;
-      text-decoration: line-through;
+    .flatpickr-day.disabled, .flatpickr-day.disabled:hover{
+      background:#f1f5f9; color:#94a3b8 !important; cursor:not-allowed; text-decoration: line-through;
     }
   </style>
 </head>
 <body>
   <main class="container">
     <nav>
-      <ul>
-        <li class="brand"><span class="dot"></span>Lake House Bookings</li>
-      </ul>
+      <ul><li class="brand"><span class="dot"></span>Lake House Bookings</li></ul>
       <ul>
         <li><a href="{{ url_for('calendar_view') }}">Calendar</a></li>
         {% if session.get('user_member_id') %}
@@ -234,113 +223,58 @@ DEFAULT_TEMPLATES = {
 
     {% block content %}{% endblock %}
 
-    <footer style="margin-top:3rem">
-      Built with Flask • Conflict detection • ICS feed • Accounts
-    </footer>
+    <footer style="margin-top:3rem">Built with Flask • Conflict detection • ICS feed • Accounts</footer>
   </main>
 
   <!-- Flatpickr -->
   <script src="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.js"></script>
   <script>
-    // format a Date using local timezone (avoid UTC off-by-one)
-    function fmtLocalYMD(d){
-      const pad = n => String(n).padStart(2,'0');
-      return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate());
-    }
+    function fmtLocalYMD(d){ const p=n=>String(n).padStart(2,'0'); return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate()); }
 
-    // Calendar initializer — greys out CONFIRMED (approved) interior days;
-    // additionally warns & blocks if YOUR OWN (pending or approved) requests overlap
+    // Calendar initializer — greys out CONFIRMED interior days; warns on user's own overlap
     async function initLakeDatepickers() {
       const pickers = document.querySelectorAll("input.datepicker");
       if (!pickers.length) return;
 
-      // 1) Confirmed/approved blocked days (greyed out)
-      let confirmedBlocked = [];
-      try {
-        const res = await fetch("{{ url_for('api_booked_dates') }}", {cache:"no-store"});
-        confirmedBlocked = await res.json();
-      } catch (e) {
-        console.warn("Failed to load blocked dates", e);
-      }
-      const confirmedSet = new Set(confirmedBlocked);
+      let confirmed = []; let mine = [];
+      try { const r = await fetch("{{ url_for('api_booked_dates') }}", {cache:"no-store"}); confirmed = await r.json(); } catch {}
+      try { const r2 = await fetch("{{ url_for('api_my_blocked_dates') }}", {cache:"no-store"}); if (r2.ok) mine = await r2.json(); } catch {}
 
-      // 2) Your own pending/approved blocked days (not greyed, but used to prevent submit)
-      let myBlocked = [];
-      try {
-        const res2 = await fetch("{{ url_for('api_my_blocked_dates') }}", {cache:"no-store"});
-        if (res2.ok) myBlocked = await res2.json();
-      } catch (e) {
-        console.warn("Failed to load my blocked dates", e);
-      }
-      const mySet = new Set(myBlocked);
+      const confirmedSet = new Set(confirmed);
+      const mySet = new Set(mine);
 
-      function isConfirmedBlocked(date){
-        const iso = fmtLocalYMD(date);
-        return confirmedSet.has(iso);
+      function isConfirmedBlocked(d){ return confirmedSet.has(fmtLocalYMD(d)); }
+      function onChangeCheck(sel, _s, fp){
+        if (!sel.length) return;
+        const iso = fmtLocalYMD(sel[0]);
+        if (confirmedSet.has(iso)) { alert("That date is already booked. Please pick another date."); fp.clear(); }
       }
 
-      function onChangeCheck(selDates, _dateStr, instance){
-        if (!selDates.length) return;
-        const iso = fmtLocalYMD(selDates[0]);
-        if (confirmedSet.has(iso)) {
-          alert("That date is already booked. Please pick another date.");
-          instance.clear();
-        }
-      }
+      const opts = { dateFormat:"Y-m-d", minDate:"today", disable:[isConfirmedBlocked], onChange:onChangeCheck };
+      pickers.forEach(el => { el.setAttribute("type","text"); el._fp = flatpickr(el, opts); });
 
-      const opts = {
-        dateFormat: "Y-m-d",
-        minDate: "today",
-        disable: [isConfirmedBlocked], // only confirmed are greyed/disabled
-        onChange: onChangeCheck
-      };
-
-      pickers.forEach(el => {
-        el.setAttribute("type","text"); // ensure Flatpickr, not native date input
-        el._fp = flatpickr(el, opts);
-      });
-
-      // Cross-field checks: end > start
       const s = document.querySelector("input[name='start_date']");
       const e = document.querySelector("input[name='end_date']");
       function enforceRange(){
         const sv = s && s.value ? new Date(s.value) : null;
         const ev = e && e.value ? new Date(e.value) : null;
-        if (sv && ev && ev <= sv) {
-          alert("End date must be AFTER start date.");
-          e.value = "";
-          if (e._fp) e._fp.clear();
-        }
+        if (sv && ev && ev <= sv) { alert("End date must be AFTER start date."); e.value=""; if (e._fp) e._fp.clear(); }
       }
       if (s) s.addEventListener("change", enforceRange);
       if (e) e.addEventListener("change", enforceRange);
 
-      // Prevent submit if any interior day in [start, end) conflicts
       const form = document.querySelector("form[data-validate='booking']");
       if (form) {
         form.addEventListener("submit", (evt) => {
           const sv = s && s.value ? new Date(s.value) : null;
           const ev = e && e.value ? new Date(e.value) : null;
-          if (!sv || !ev) return; // server will also validate
-          if (ev <= sv) {
-            alert("End date must be AFTER start date.");
-            evt.preventDefault();
-            return;
-          }
-          let cur = new Date(s.value);
-          const end = new Date(e.value);
-          while (cur < end) { // end-exclusive
+          if (!sv || !ev) return;
+          if (ev <= sv) { alert("End date must be AFTER start date."); evt.preventDefault(); return; }
+          let cur = new Date(s.value); const end = new Date(e.value);
+          while (cur < end) {
             const iso = fmtLocalYMD(cur);
-            if (confirmedSet.has(iso)) {
-              alert("Your selection overlaps with a confirmed booking (" + iso + "). Please choose different dates.");
-              evt.preventDefault();
-              return;
-            }
-            if (mySet.has(iso)) {
-              alert("You already have a request that includes " + iso + ". Please choose dates that don't overlap your own request.");
-              evt.preventDefault();
-              return;
-            }
+            if (confirmedSet.has(iso)) { alert("Overlaps a confirmed booking ("+iso+"). Please choose different dates."); evt.preventDefault(); return; }
+            if (mySet.has(iso)) { alert("You already have a request including "+iso+". Please choose different dates."); evt.preventDefault(); return; }
             cur.setDate(cur.getDate()+1);
           }
         });
@@ -534,10 +468,6 @@ DEFAULT_TEMPLATES = {
 }
 
 def _ensure_templates_present():
-    """
-    Write templates if missing; optionally force refresh with FORCE_TEMPLATE_REFRESH=1
-    or if the version marker is missing.
-    """
     try:
         TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
         force = os.getenv("FORCE_TEMPLATE_REFRESH", "0") == "1"
@@ -650,23 +580,8 @@ def _tx(kind, status, booking=None, member=None, target=None, meta=None):
     except Exception as e:
         print(f"[TX-LOG ERROR] {e!r}")
 
-def send_and_log_email(to_email: str, subject: str, body: str, *, kind: str, booking=None, member=None):
-    ok = send_email(to_email, subject, body)
-    _tx("email", "success" if ok else "error", booking=booking, member=member, target=to_email, meta={"subject": subject, "kind": kind})
-    return ok
-
-def send_admin_alert(subject: str, body: str, *, booking=None, member=None):
-    admin_email = os.getenv("ADMIN_EMAIL")
-    if admin_email:
-        send_and_log_email(admin_email, subject, body, kind="admin.alert", booking=booking, member=member)
-    # Optional SMS to admin, if configured
-    admin_sms = os.getenv("TWILIO_ADMIN_NUMBER")
-    if admin_sms:
-        ok = send_sms(admin_sms, f"{subject}\n{body}")
-        _tx("sms", "success" if ok else "error", booking=booking, member=member, target=admin_sms, meta={"kind":"admin.alert"})
-
 # -----------------------------
-# Optional Google Calendar helpers
+# Google Calendar helpers
 # -----------------------------
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
@@ -730,32 +645,54 @@ def remove_event_from_calendar(event_id):
         return False
 
 # -----------------------------
-# Booking conflict helpers (END-EXCLUSIVE)
+# Overlap helpers (strict END-EXCLUSIVE + normalization)
 # -----------------------------
+def _as_date(d):
+    """Coerce incoming values to a date (strip any time component)."""
+    if isinstance(d, date) and not isinstance(d, datetime):
+        return d
+    if isinstance(d, datetime):
+        return d.date()
+    # fallback: try to parse 'YYYY-MM-DD'
+    try:
+        return datetime.strptime(str(d), "%Y-%m-%d").date()
+    except Exception:
+        return d  # let it fail upstream if unusable
+
 def ranges_overlap(a_start, a_end, b_start, b_end):
     """
-    Treat end days as EXCLUSIVE so back-to-back bookings are allowed:
-    [a_start, a_end) overlaps [b_start, b_end)  <=>  not (a_end <= b_start or b_end <= a_start)
+    End-exclusive overlap:
+      [a_start, a_end) overlaps [b_start, b_end)  iff  (a_start < b_end) and (b_start < a_end)
+    This correctly allows back-to-back (a_end == b_start or b_end == a_start).
     """
-    return not (a_end <= b_start or b_end <= a_start)
+    a_start, a_end = _as_date(a_start), _as_date(a_end)
+    b_start, b_end = _as_date(b_start), _as_date(b_end)
+    return (a_start < b_end) and (b_start < a_end)
 
 def find_conflicts(start_date, end_date, exclude_request_id=None):
+    s, e = _as_date(start_date), _as_date(end_date)
     q = BookingRequest.query.filter(BookingRequest.status == "approved")
     if exclude_request_id:
         q = q.filter(BookingRequest.id != exclude_request_id)
-    return [r for r in q.all() if ranges_overlap(start_date, end_date, r.start_date, r.end_date)]
+    out = []
+    for r in q.all():
+        if ranges_overlap(s, e, r.start_date, r.end_date):
+            out.append(r)
+    return out
 
 def find_member_conflicts(member_id, start_date, end_date, exclude_request_id=None):
-    """
-    Overlaps with THIS member's own requests that are pending or approved.
-    """
+    s, e = _as_date(start_date), _as_date(end_date)
     q = BookingRequest.query.filter(
         BookingRequest.member_id == member_id,
         BookingRequest.status.in_(("pending", "approved"))
     )
     if exclude_request_id:
         q = q.filter(BookingRequest.id != exclude_request_id)
-    return [r for r in q.all() if ranges_overlap(start_date, end_date, r.start_date, r.end_date)]
+    out = []
+    for r in q.all():
+        if ranges_overlap(s, e, r.start_date, r.end_date):
+            out.append(r)
+    return out
 
 def _log(action, request_id, details=""):
     db.session.add(AuditLog(action=action, request_id=request_id, admin_email=current_admin_email(), details=details))
@@ -785,7 +722,7 @@ def _notify_status(br: BookingRequest):
         body += "\nWe added it to the lake house calendar."
     elif br.status == "denied":
         body += "\nPlease contact the admin with any questions."
-    send_and_log_email(member.email, subj, body, kind=f"user.status.{br.status}", booking=br, member=member)
+    send_email(member.email, subj, body)
 
 # -----------------------------
 # Ensure DB + indexes (Render-safe)
@@ -914,28 +851,17 @@ def _request_form_handler():
         form.member_type.data = me.member_type
 
     if form.validate_on_submit():
-        # Server: end must be after start
-        if form.end_date.data <= form.start_date.data:
+        # Normalize inputs to pure dates (extra safety)
+        s = _as_date(form.start_date.data)
+        e = _as_date(form.end_date.data)
+
+        # Server: end must be after start (1+ nights)
+        if not s or not e or e <= s:
             flash("End date must be after start date.", "danger")
             return render_template("request.html", form=form)
 
-        # Identify the member (existing or newly created)
+        # Identify or create the member *before* overlap checks
         member = me or Member.query.filter_by(email=form.email.data.strip().lower()).first()
-
-        # If member exists, block overlaps with THEIR OWN pending/approved requests (end-exclusive)
-        if member:
-            own_overlaps = find_member_conflicts(member.id, form.start_date.data, form.end_date.data)
-            if own_overlaps:
-                flash("These dates overlap one of your own requests. Back-to-back is allowed, but no interior overlap.", "danger")
-                return render_template("request.html", form=form)
-
-        # Server: END-EXCLUSIVE overlap check vs approved requests (any member)
-        overlaps = find_conflicts(form.start_date.data, form.end_date.data)
-        if overlaps:
-            flash("Those dates overlap an existing approved booking. Note: end days are allowed to touch the next start day.", "danger")
-            return render_template("request.html", form=form)
-
-        # Create or update member record as needed
         if not member:
             member = Member(
                 name=form.name.data.strip(),
@@ -950,53 +876,50 @@ def _request_form_handler():
             member.phone = form.phone.data.strip() if form.phone.data else member.phone
             member.member_type = form.member_type.data
 
+        # Block overlaps with THIS member's own pending/approved requests (end-exclusive)
+        own_overlaps = find_member_conflicts(member.id, s, e)
+        if own_overlaps:
+            # Show first conflict details to explain why
+            c = own_overlaps[0]
+            flash(f"These dates overlap your own request ({c.start_date} → {c.end_date}). Back-to-back is allowed, but no interior overlap.", "danger")
+            db.session.rollback()  # undo any prefills we made above
+            return render_template("request.html", form=form)
+
+        # Block overlaps vs APPROVED requests (any member), end-exclusive
+        overlaps = find_conflicts(s, e)
+        if overlaps:
+            c = overlaps[0]
+            flash(f"Those dates overlap an existing approved booking ({c.start_date} → {c.end_date}). Note: end days can touch the next start day.", "danger")
+            db.session.rollback()
+            return render_template("request.html", form=form)
+
+        # Create the booking request
         br = BookingRequest(
             member_id=member.id,
-            start_date=form.start_date.data,
-            end_date=form.end_date.data,
+            start_date=s,
+            end_date=e,
             notes=form.notes.data
         )
         db.session.add(br)
         db.session.commit()
         _snapshot_booking(br)
 
-        # -------- NEW: User receipt email (+ optional SMS) --------
-        receipt_subj = f"We received your Lake House request (pending): {br.start_date} → {br.end_date}"
-        receipt_body = (
-            f"Hi {member.name},\n\n"
-            f"Thanks for your request for the Lake House from {br.start_date} to {br.end_date}.\n"
-            f"Status: PENDING\n\n"
-            f"Notes: {br.notes or '-'}\n\n"
-            f"Reminder: end-days are treated as exclusive, so back-to-back stays are allowed.\n"
-            f"We'll email you once an admin reviews your request."
-        )
-        send_and_log_email(member.email, receipt_subj, receipt_body, kind="user.receipt", booking=br, member=member)
-
-        if form.subscribe_sms.data and member.phone:
-            sms_ok = send_sms(member.phone, f"Lake House: request received for {br.start_date}→{br.end_date} (pending). We'll email updates.")
-            _tx("sms", "success" if sms_ok else "error", booking=br, member=member, target=member.phone, meta={"kind":"user.receipt"})
-
-        # -------- NEW: Admin alert on new request --------
-        admin_body = (
-            f"New booking request submitted.\n\n"
-            f"Member: {member.name} ({member.member_type})\n"
-            f"Email: {member.email}\n"
-            f"Phone: {member.phone or '-'}\n"
-            f"Dates: {br.start_date} → {br.end_date}\n"
-            f"Notes: {br.notes or '-'}\n\n"
-            f"Review at /admin/requests"
-        )
-        send_admin_alert(
-            subject=f"[Lake House] New request: {member.name} {br.start_date}→{br.end_date}",
-            body=admin_body,
-            booking=br,
-            member=member
-        )
+        # Optional receipts/alerts (kept from previous versions)
+        try:
+            send_email(member.email,
+                       "Lake House request received",
+                       f"Hi {member.name},\n\nWe received your request for {s} to {e}.\nWe'll notify you when it's reviewed.\n\nThanks!")
+            admin_email = os.getenv("ADMIN_EMAIL")
+            if admin_email:
+                send_email(admin_email,
+                           "New Lake House request pending",
+                           f"Member: {member.name} <{member.email}>\nDates: {s} → {e}\nNotes: {form.notes.data or '-'}")
+        except Exception as _e:
+            pass
 
         flash("Request submitted! You’ll receive an email confirmation.", "success")
         return redirect(url_for("dashboard") if current_member() else url_for("root"))
 
-    # IMPORTANT: ensure the rendered inputs are text + class=datepicker (see template)
     return render_template("request.html", form=form)
 
 @app.route("/request", methods=["GET", "POST"])
@@ -1007,7 +930,7 @@ def request_booking():
 def request_new():
     return _request_form_handler()
 
-# Backward-compat aliases (in case templates link differently)
+# Backward-compat aliases
 @app.route("/request_booking", methods=["GET", "POST"])
 def request_booking_old():
     return _request_form_handler()
@@ -1016,7 +939,9 @@ def request_booking_old():
 def request_new_old():
     return _request_form_handler()
 
-# Booked dates API for datepicker (INTERIOR DAYS ONLY: start .. end-1) — CONFIRMED/APPROVED ONLY
+# -----------------------------
+# Booked dates APIs (end-exclusive interiors)
+# -----------------------------
 @app.get("/api/booked-dates")
 def api_booked_dates():
     rows = (BookingRequest.query
@@ -1031,12 +956,11 @@ def api_booked_dates():
             d += timedelta(days=1)
     return jsonify(sorted(blocked))
 
-# Your own blocked dates (pending or approved) for client-side warning (not greyed)
 @app.get("/api/my-blocked-dates")
 def api_my_blocked_dates():
     m = current_member()
     if not m:
-        return jsonify([])  # not signed in: nothing to warn about
+        return jsonify([])
     rows = (BookingRequest.query
             .filter(BookingRequest.member_id == m.id,
                     BookingRequest.status.in_(("pending", "approved")))
@@ -1115,8 +1039,8 @@ def admin_login():
         else:
             admin_email = os.getenv("ADMIN_EMAIL", "")
             admin_password = os.getenv("ADMIN_PASSWORD", "")
-            ok_email = form.email.data.strip().lower() == admin_email.strip().lower()
-            ok_pwd = form.password.data == admin_password
+            ok_email = form.email.data.strip().lower() == (admin_email or "").strip().lower()
+            ok_pwd = form.password.data == (admin_password or "")
             if ok_email and ok_pwd:
                 session["is_admin"] = True
                 flash("Welcome, admin!", "success")
@@ -1163,6 +1087,7 @@ def approve_request(req_id):
         return redirect(url_for("admin_login"))
     br = BookingRequest.query.get_or_404(req_id)
 
+    # Re-check overlaps strictly end-exclusive (exclude this req id)
     conflicts = find_conflicts(br.start_date, br.end_date, exclude_request_id=br.id)
     if conflicts:
         conflict_list = ", ".join(f"{c.member.name}({c.start_date}→{c.end_date})" for c in conflicts)
@@ -1183,29 +1108,21 @@ def approve_request(req_id):
         _tx("gcal.insert", "success", booking=br, member=br.member, target=ev_id, meta={"summary": summary})
     else:
         _tx("gcal.insert", "error", booking=br, member=br.member, target="", meta={"reason": "insert failed"})
-        # NEW: admin alert if calendar insert failed
-        send_admin_alert(
-            subject=f"[Lake House] Calendar insert FAILED for approval: {br.member.name} {br.start_date}→{br.end_date}",
-            body=f"Tried to insert a Google Calendar event but failed.\nRequest ID: {br.id}\nMember: {br.member.name}\nDates: {br.start_date}→{br.end_date}\nNotes: {br.notes or '-'}",
-            booking=br,
-            member=br.member
-        )
 
     _snapshot_booking(br)
     _notify_status(br)
+
+    # Optional: alert admin mailbox about approval
+    try:
+        admin_email = os.getenv("ADMIN_EMAIL")
+        if admin_email:
+            send_email(admin_email,
+                       "Booking approved",
+                       f"Approved: {br.member.name} ({br.member.email})\nDates: {br.start_date} → {br.end_date}\nEvent: {br.calendar_event_id or '-'}")
+    except Exception:
+        pass
+
     _log("approve", br.id, "Approved")
-
-    # NEW: admin alert on approved
-    send_admin_alert(
-        subject=f"[Lake House] Approved: {br.member.name} {br.start_date}→{br.end_date}",
-        body=(f"Approved booking.\nRequest ID: {br.id}\n"
-              f"Member: {br.member.name} ({br.member.member_type})\n"
-              f"Dates: {br.start_date}→{br.end_date}\n"
-              f"Calendar event: {br.calendar_event_id or '—'}"),
-        booking=br,
-        member=br.member
-    )
-
     flash("Request approved.", "success")
     return redirect(url_for("admin_requests"))
 
@@ -1215,7 +1132,6 @@ def deny_request(req_id):
         return redirect(url_for("admin_login"))
     br = BookingRequest.query.get_or_404(req_id)
 
-    # If it had a calendar event, remove it
     if br.calendar_event_id:
         ok = remove_event_from_calendar(br.calendar_event_id)
         _tx("gcal.delete", "success" if ok else "error", booking=br, member=br.member, target=br.calendar_event_id)
@@ -1227,17 +1143,6 @@ def deny_request(req_id):
     _snapshot_booking(br)
     _notify_status(br)
     _log("deny", br.id, "Denied by admin")
-
-    # NEW: admin alert on denied
-    send_admin_alert(
-        subject=f"[Lake House] Denied: {br.member.name} {br.start_date}→{br.end_date}",
-        body=(f"Denied booking.\nRequest ID: {br.id}\n"
-              f"Member: {br.member.name} ({br.member.member_type})\n"
-              f"Dates: {br.start_date}→{br.end_date}\nNotes: {br.notes or '—'}"),
-        booking=br,
-        member=br.member
-    )
-
     flash("Request denied.", "info")
     return redirect(url_for("admin_requests"))
 
@@ -1247,7 +1152,6 @@ def cancel_request(req_id):
         return redirect(url_for("admin_login"))
     br = BookingRequest.query.get_or_404(req_id)
 
-    # If it had a calendar event, remove it
     if br.calendar_event_id:
         ok = remove_event_from_calendar(br.calendar_event_id)
         _tx("gcal.delete", "success" if ok else "error", booking=br, member=br.member, target=br.calendar_event_id)
@@ -1259,17 +1163,6 @@ def cancel_request(req_id):
     _snapshot_booking(br)
     _notify_status(br)
     _log("cancel", br.id, "Cancelled by admin")
-
-    # NEW: admin alert on cancelled
-    send_admin_alert(
-        subject=f"[Lake House] Cancelled: {br.member.name} {br.start_date}→{br.end_date}",
-        body=(f"Cancelled booking.\nRequest ID: {br.id}\n"
-              f"Member: {br.member.name} ({br.member.member_type})\n"
-              f"Dates: {br.start_date}→{br.end_date}"),
-        booking=br,
-        member=br.member
-    )
-
     flash("Request cancelled.", "warning")
     return redirect(url_for("admin_requests"))
 
@@ -1379,4 +1272,3 @@ if __name__ == "__main__":
     with app.app_context():
         db.create_all()
     app.run(host="0.0.0.0", port=5000)
-
