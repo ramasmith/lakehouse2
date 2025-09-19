@@ -1,11 +1,7 @@
 # app.py — Lake House bookings
 # End-exclusive model: allow back-to-back bookings (end == next start).
-# Changes vs. prior:
-# - SQL overlap checks (no Python filtering surprises)
-# - Detailed debug logging shows the exact conflicting rows
-# - Diagnostic route /_test_overlap?s=YYYY-MM-DD&e=YYYY-MM-DD
-# - Google Calendar + ICS use DB end (already exclusive)
-# - Flatpickr: only start dates are disabled from approved interiors
+# Calendar sync: resilient Google Calendar upsert (OAuth token.json OR Service Account).
+# Debug: detailed logs + /admin/requests/<id>/resync to fix stragglers.
 
 import os, sys, json, csv, socket
 from io import StringIO
@@ -24,7 +20,7 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_wtf import FlaskForm
 from wtforms import StringField, SelectField, DateField, TextAreaField, SubmitField, BooleanField, PasswordField
 from wtforms.validators import DataRequired, Email, Length
-from sqlalchemy import case, text, and_
+from sqlalchemy import case, text
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # Notifications (SMTP)
@@ -38,11 +34,13 @@ except Exception:
     TwilioClient = None
 
 # Google Calendar (optional; DRY-RUN if missing)
+GOOGLE_OK = True
 try:
-    from google.oauth2.credentials import Credentials
+    from google.oauth2.credentials import Credentials as OAuthCredentials
+    from google.oauth2.service_account import Credentials as SACredentials
     from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
     from google.auth.transport.requests import Request
-    GOOGLE_OK = True
 except Exception:
     GOOGLE_OK = False
 
@@ -92,7 +90,7 @@ class BookingRequest(db.Model):
 
 class AuditLog(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    action = db.Column(db.String(32), nullable=False)  # approve/deny/cancel/create
+    action = db.Column(db.String(32), nullable=False)  # approve/deny/cancel/create/resync
     request_id = db.Column(db.Integer, db.ForeignKey('booking_request.id'), nullable=True)
     admin_email = db.Column(db.String(255), nullable=True)
     details = db.Column(db.Text, nullable=True)
@@ -102,7 +100,7 @@ class AuditLog(db.Model):
 class DataTransaction(db.Model):
     __tablename__ = "data_transaction"
     id = db.Column(db.Integer, primary_key=True)
-    kind = db.Column(db.String(40), nullable=False)      # "email","sms","gcal.insert","gcal.delete"
+    kind = db.Column(db.String(40), nullable=False)      # "email","sms","gcal.upsert","gcal.delete"
     status = db.Column(db.String(20), nullable=False)    # "success","error","skip"
     booking_request_id = db.Column(db.Integer, db.ForeignKey('booking_request.id'))
     member_id = db.Column(db.Integer, db.ForeignKey('member.id'))
@@ -139,7 +137,6 @@ class RequestForm(FlaskForm):
         ("due", "Due-paying member"),
         ("non_due", "Non due-paying member")
     ], validators=[DataRequired()])
-    # We render these as text (Flatpickr) but WTForms still parses them as dates
     start_date = DateField("Start Date", validators=[DataRequired()], format="%Y-%m-%d")
     end_date = DateField("End Date", validators=[DataRequired()], format="%Y-%m-%d")
     notes = TextAreaField("Notes (optional)")
@@ -170,7 +167,6 @@ class SignupForm(FlaskForm):
 # Self-healing templates
 # -----------------------------
 DEFAULT_TEMPLATES = {
-    # version bump to refresh template on disk
     "base.html": r"""<!-- LAKEHOUSE_BASE_V7 -->
 <!doctype html>
 <html lang="en">
@@ -182,9 +178,7 @@ DEFAULT_TEMPLATES = {
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
 
   <style>
-    :root{
-      --lake-blue:#3aa4c4; --pine:#1b3a3a; --sand:#f9f6ef; --sun:#ffd166; --text:#0f172a;
-    }
+    :root{ --lake-blue:#3aa4c4; --pine:#1b3a3a; --sand:#f9f6ef; --sun:#ffd166; --text:#0f172a; }
     body{ background: linear-gradient(180deg, var(--sand) 0%, #ffffff 80%); color: var(--text); }
     nav{ background: linear-gradient(90deg, var(--lake-blue), #7fd3e7); border-radius: 16px; padding: .75rem 1rem; }
     nav a{ color:#083344; font-weight:600; }
@@ -194,21 +188,13 @@ DEFAULT_TEMPLATES = {
     .btn-primary{ background: var(--lake-blue); border:none; }
     .tag{ padding:.15rem .4rem; border-radius:999px; background:#eef2f7; color:#475569; font-size:.75rem;}
     footer{ color:#64748b; font-size:.9rem; }
-    .flatpickr-day.disabled,
-    .flatpickr-day.disabled:hover{
-      background:#f1f5f9;
-      color:#94a3b8 !important;
-      cursor:not-allowed;
-      text-decoration: line-through;
-    }
+    .flatpickr-day.disabled, .flatpickr-day.disabled:hover{ background:#f1f5f9; color:#94a3b8 !important; cursor:not-allowed; text-decoration: line-through; }
   </style>
 </head>
 <body>
   <main class="container">
     <nav>
-      <ul>
-        <li class="brand"><span class="dot"></span>Lake House Bookings</li>
-      </ul>
+      <ul><li class="brand"><span class="dot"></span>Lake House Bookings</li></ul>
       <ul>
         <li><a href="{{ url_for('calendar_view') }}">Calendar</a></li>
         {% if session.get('user_member_id') %}
@@ -245,104 +231,23 @@ DEFAULT_TEMPLATES = {
     </footer>
   </main>
 
-  <!-- Flatpickr -->
   <script src="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.js"></script>
   <script>
-    // local YYYY-MM-DD (avoid UTC shift)
-    function fmtLocalYMD(d){
-      const pad = n => String(n).padStart(2,'0');
-      return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate());
-    }
-
-    // Calendar initializer
-    // - Greys out CONFIRMED interior days on START picker only
-    // - END picker stays free so end == other.start is selectable
-    // - Submit-time scan still blocks interiors [start, end)
-    // - Warns on user's own pending/approved overlaps
+    function fmtLocalYMD(d){const pad=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate());}
     async function initLakeDatepickers() {
-      const startEl = document.querySelector("input[name='start_date']");
-      const endEl   = document.querySelector("input[name='end_date']");
-      if (!startEl && !endEl) return;
-
-      let confirmedBlocked = [];
-      let myBlocked = [];
-      try {
-        const r = await fetch("{{ url_for('api_booked_dates') }}", {cache:"no-store"});
-        confirmedBlocked = await r.json();
-      } catch(e) { console.warn("blocked fetch fail", e); }
-      try {
-        const r2 = await fetch("{{ url_for('api_my_blocked_dates') }}", {cache:"no-store"});
-        if (r2.ok) myBlocked = await r2.json();
-      } catch(e) { console.warn("my-blocked fetch fail", e); }
-
-      const confirmedSet = new Set(confirmedBlocked);
-      const mySet = new Set(myBlocked);
-
-      function isConfirmedBlocked(date){ return confirmedSet.has(fmtLocalYMD(date)); }
-      function onChangeCheckStart(sel, _s, fp){
-        if (!sel.length) return;
-        const iso = fmtLocalYMD(sel[0]);
-        if (confirmedSet.has(iso)) { alert("That start date is already booked. Please pick another start."); fp.clear(); }
-      }
-
-      // Force text inputs
-      if (startEl) startEl.setAttribute("type","text");
-      if (endEl)   endEl.setAttribute("type","text");
-
-      // START picker: disable confirmed interiors
-      if (startEl) {
-        startEl._fp = flatpickr(startEl, {
-          dateFormat: "Y-m-d",
-          minDate: "today",
-          disable: [isConfirmedBlocked],
-          onChange: onChangeCheckStart
-        });
-      }
-      // END picker: keep free
-      if (endEl) {
-        endEl._fp = flatpickr(endEl, {
-          dateFormat: "Y-m-d",
-          minDate: "today"
-        });
-      }
-
-      // Cross-field checks: end > start
-      function enforceRange(){
-        const sv = startEl && startEl.value ? new Date(startEl.value) : null;
-        const ev = endEl   && endEl.value   ? new Date(endEl.value)   : null;
-        if (sv && ev && ev <= sv) {
-          alert("End date must be AFTER start date.");
-          endEl.value = "";
-          if (endEl._fp) endEl._fp.clear();
-        }
-      }
-      if (startEl) startEl.addEventListener("change", enforceRange);
-      if (endEl)   endEl.addEventListener("change", enforceRange);
-
-      // Submit-time guard: check interiors [start, end)
-      const form = document.querySelector("form[data-validate='booking']");
-      if (form) {
-        form.addEventListener("submit", (evt) => {
-          const sv = startEl && startEl.value ? new Date(startEl.value) : null;
-          const ev = endEl   && endEl.value   ? new Date(endEl.value)   : null;
-          if (!sv || !ev) return;
-          if (ev <= sv) { alert("End date must be AFTER start date."); evt.preventDefault(); return; }
-          let cur = new Date(startEl.value);
-          const end = new Date(endEl.value);
-          while (cur < end) { // end-exclusive
-            const iso = fmtLocalYMD(cur);
-            if (confirmedSet.has(iso)) {
-              alert("Your selection overlaps a confirmed booking on " + iso + ". Please adjust.");
-              evt.preventDefault(); return;
-            }
-            if (mySet.has(iso)) {
-              alert("You already have a request that includes " + iso + ". Please choose non-overlapping dates.");
-              evt.preventDefault(); return;
-            }
-            cur.setDate(cur.getDate()+1);
-          }
-        });
-      }
+      const startEl=document.querySelector("input[name='start_date']"); const endEl=document.querySelector("input[name='end_date']"); if(!startEl&&!endEl) return;
+      let confirmedBlocked=[], myBlocked=[];
+      try{const r=await fetch("{{ url_for('api_booked_dates') }}",{cache:"no-store"}); confirmedBlocked=await r.json();}catch(e){console.warn("blocked fetch fail",e);}
+      try{const r2=await fetch("{{ url_for('api_my_blocked_dates') }}",{cache:"no-store"}); if(r2.ok) myBlocked=await r2.json();}catch(e){console.warn("my-blocked fetch fail",e);}
+      const confirmedSet=new Set(confirmedBlocked); const mySet=new Set(myBlocked);
+      function isConfirmedBlocked(date){return confirmedSet.has(fmtLocalYMD(date));}
+      function onChangeCheckStart(sel,_s,fp){if(!sel.length)return; const iso=fmtLocalYMD(sel[0]); if(confirmedSet.has(iso)){alert("That start date is already booked. Please pick another start."); fp.clear();}}
+      if(startEl) startEl.setAttribute("type","text"); if(endEl) endEl.setAttribute("type","text");
+      if(startEl){ startEl._fp=flatpickr(startEl,{dateFormat:"Y-m-d",minDate:"today",disable:[isConfirmedBlocked],onChange:onChangeCheckStart}); }
+      if(endEl){ endEl._fp=flatpickr(endEl,{dateFormat:"Y-m-d",minDate:"today"}); }
+      function enforceRange(){const sv=startEl&&startEl.value?new Date(startEl.value):null; const ev=endEl&&endEl.value?new Date(endEl.value):null; if(sv&&ev&&ev<=sv){alert("End date must be AFTER start date."); endEl.value=""; if(endEl._fp) endEl._fp.clear();}}
+      if(startEl) startEl.addEventListener("change",enforceRange); if(endEl) endEl.addEventListener("change",enforceRange);
+      const form=document.querySelector("form[data-validate='booking']"); if(form){ form.addEventListener("submit",(evt)=>{const sv=startEl&&startEl.value?new Date(startEl.value):null; const ev=endEl&&endEl.value?new Date(endEl.value):null; if(!sv||!ev) return; if(ev<=sv){alert("End date must be AFTER start date."); evt.preventDefault(); return;} let cur=new Date(startEl.value); const end=new Date(endEl.value); while(cur<end){const iso=fmtLocalYMD(cur); if(confirmedSet.has(iso)){alert("Your selection overlaps a confirmed booking on "+iso+". Please adjust."); evt.preventDefault(); return;} if(mySet.has(iso)){alert("You already have a request that includes "+iso+". Please choose non-overlapping dates."); evt.preventDefault(); return;} cur.setDate(cur.getDate()+1);} }); }
     }
     document.addEventListener("DOMContentLoaded", initLakeDatepickers);
   </script>
@@ -436,7 +341,6 @@ DEFAULT_TEMPLATES = {
     <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
     <label>{{ form.phone.label }} {{ form.phone(size=20) }}</label>
     <label>{{ form.member_type.label }} {{ form.member_type() }}</label>
-    <!-- Force type='text' + class for Flatpickr -->
     <label>{{ form.start_date.label }} {{ form.start_date(class_="datepicker", type="text", placeholder="YYYY-MM-DD") }}</label>
     <label>{{ form.end_date.label }} {{ form.end_date(class_="datepicker", type="text", placeholder="YYYY-MM-DD") }}</label>
   </div>
@@ -472,6 +376,7 @@ DEFAULT_TEMPLATES = {
       <td>
         <form method="POST" action="{{ url_for('approve_request', req_id=r.id) }}" style="display:inline;"><button>Approve</button></form>
         <form method="POST" action="{{ url_for('deny_request', req_id=r.id) }}" style="display:inline;"><button class="secondary">Deny</button></form>
+        <form method="POST" action="{{ url_for('resync_request', req_id=r.id) }}" style="display:inline;"><button class="contrast">Resync Calendar</button></form>
       </td>
     </tr>
   {% endfor %}
@@ -494,6 +399,7 @@ DEFAULT_TEMPLATES = {
       <td>
         <form method="POST" action="{{ url_for('deny_request', req_id=r.id) }}" style="display:inline;"><button class="secondary">Revoke</button></form>
         <form method="POST" action="{{ url_for('cancel_request', req_id=r.id) }}" style="display:inline;"><button class="contrast">Cancel</button></form>
+        <form method="POST" action="{{ url_for('resync_request', req_id=r.id) }}" style="display:inline;"><button>Resync Calendar</button></form>
       </td>
     </tr>
   {% endfor %}
@@ -532,10 +438,6 @@ DEFAULT_TEMPLATES = {
 }
 
 def _ensure_templates_present():
-    """
-    Write templates if missing; optionally force refresh with FORCE_TEMPLATE_REFRESH=1
-    or if the version marker is missing.
-    """
     try:
         TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
         force = os.getenv("FORCE_TEMPLATE_REFRESH", "0") == "1"
@@ -594,16 +496,14 @@ def send_email(to_email: str, subject: str, body: str) -> bool:
     try:
         if secure == "ssl" or port == 465:
             with smtplib.SMTP_SSL(host=host, port=port, timeout=timeout) as server:
-                if user and pwd:
-                    server.login(user, pwd)
+                if user and pwd: server.login(user, pwd)
                 server.send_message(msg)
         else:
             with smtplib.SMTP(host=host, port=port, timeout=timeout) as server:
                 server.ehlo()
                 if secure == "starttls" or port == 587:
                     server.starttls(); server.ehlo()
-                if user and pwd:
-                    server.login(user, pwd)
+                if user and pwd: server.login(user, pwd)
                 server.send_message(msg)
         print(f"[EMAIL OK] sent → {to_email}")
         return True
@@ -654,70 +554,149 @@ def _tx(kind, status, booking=None, member=None, target=None, meta=None):
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 def _get_google_creds():
+    """
+    Return Google credentials using either:
+    - Service Account JSON (env GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_FILE),
+      with optional GOOGLE_IMPERSONATE for domain delegation; or
+    - OAuth user flow via token.json (server-side refresh supported).
+    """
     if not GOOGLE_OK:
-        print("[Calendar] google libraries not installed; skipping.")
+        app.logger.warning("[Calendar] google libraries not installed; skipping.")
         return None
+
+    # Service Account (recommended for servers)
+    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    sa_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+    subject = os.getenv("GOOGLE_IMPERSONATE")  # e.g., calendar owner email for domain-wide delegation
+
+    try:
+        if sa_json or sa_file:
+            info = None
+            if sa_json:
+                info = json.loads(sa_json)
+            else:
+                with open(sa_file, "r", encoding="utf-8") as f:
+                    info = json.load(f)
+            creds = SACredentials.from_service_account_info(info, scopes=SCOPES)
+            if subject:
+                creds = creds.with_subject(subject)
+            app.logger.info("[Calendar] Using Service Account credentials.")
+            return creds
+    except Exception as e:
+        app.logger.error(f"[Calendar] Service Account load failed: {e!r}")
+
+    # OAuth token.json (local dev or previously authorized server)
     token_path = BASE_DIR / "token.json"
     if token_path.exists():
-        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-        if not creds.valid:
-            if creds.refresh_token:
+        try:
+            creds = OAuthCredentials.from_authorized_user_file(str(token_path), SCOPES)
+            if not creds.valid and creds.refresh_token:
                 try:
                     creds.refresh(Request())
-                    with open(token_path, "w") as f:
-                        f.write(creds.to_json())
+                    token_path.write_text(creds.to_json(), encoding="utf-8")
+                    app.logger.info("[Calendar] OAuth token refreshed.")
                 except Exception as e:
-                    print(f"[Calendar] Refresh failed: {e}")
+                    app.logger.error(f"[Calendar] OAuth refresh failed: {e!r}")
                     return None
-        return creds
-    print("[Calendar] token.json not found; skipping calendar sync on server.")
+            app.logger.info("[Calendar] Using OAuth token.json credentials.")
+            return creds
+        except Exception as e:
+            app.logger.error(f"[Calendar] token.json invalid: {e!r}")
+
+    app.logger.warning("[Calendar] No credentials found (set GOOGLE_SERVICE_ACCOUNT_JSON or token.json).")
     return None
 
-def add_event_to_calendar(summary, start_date, end_date, description=""):
+def _calendar_service():
     calendar_id = os.getenv("GOOGLE_CALENDAR_ID")
-    if not (calendar_id and GOOGLE_OK):
-        print("[Calendar] Missing GOOGLE_CALENDAR_ID or google libs; skipping.")
-        return None
+    if not calendar_id:
+        app.logger.warning("[Calendar] GOOGLE_CALENDAR_ID not set; skipping.")
+        return None, None
     creds = _get_google_creds()
     if not creds:
-        return None
+        return None, None
     try:
-        service = build("calendar", "v3", credentials=creds)
-        event_body = {
-            "summary": summary,
-            "description": description,
-            "start": {"date": start_date.isoformat()},
-            # DB end is already exclusive → use as-is for all-day events
-            "end": {"date": end_date.isoformat()},
-        }
-        event = service.events().insert(calendarId=calendar_id, body=event_body).execute()
-        print(f"[Calendar] Inserted event id={event.get('id')}")
-        return event.get("id")
+        svc = build("calendar", "v3", credentials=creds, cache_discovery=False)
+        return svc, calendar_id
     except Exception as e:
-        print(f"[Calendar] Insert failed: {e!r}")
-        return None
+        app.logger.error(f"[Calendar] build service failed: {e!r}")
+        return None, None
+
+def _event_body(summary, start_date, end_date, description=""):
+    # All-day event with end-exclusive dates
+    return {
+        "summary": summary,
+        "description": description,
+        "start": {"date": start_date.isoformat()},
+        "end": {"date": end_date.isoformat()},
+    }
+
+def upsert_event_to_calendar(br):
+    """
+    Insert or update a calendar event for a BookingRequest.
+    - If event id exists, try update; if 404, insert again (recreate).
+    Returns (ok:bool, event_id_or_reason:str).
+    """
+    svc, cal_id = _calendar_service()
+    if not svc or not cal_id:
+        _tx("gcal.upsert", "skip", booking=br, member=br.member, target="", meta={"reason": "no credentials/calendar id"})
+        return False, "calendar not configured"
+
+    body = _event_body(
+        summary=f"Lake House: {br.member.name} ({br.member.member_type})",
+        start_date=br.start_date,
+        end_date=br.end_date,
+        description=(br.notes or "") + f"\nMember email: {br.member.email}"
+    )
+
+    try:
+        if br.calendar_event_id:
+            try:
+                ev = svc.events().update(calendarId=cal_id, eventId=br.calendar_event_id, body=body).execute()
+                app.logger.info(f"[Calendar] Updated event id={ev.get('id')}")
+                _tx("gcal.upsert", "success", booking=br, member=br.member, target=ev.get("id"), meta={"mode": "update"})
+                return True, ev.get("id")
+            except HttpError as he:
+                if getattr(he, "status_code", None) == 404 or "Not Found" in str(he):
+                    app.logger.warning("[Calendar] Existing event id not found; recreating...")
+                else:
+                    app.logger.error(f"[Calendar] Update failed: {he!r}")
+                    _tx("gcal.upsert", "error", booking=br, member=br.member, target=br.calendar_event_id, meta={"error": str(he), "mode":"update"})
+                    return False, f"update failed: {he}"
+
+        # insert
+        ev = svc.events().insert(calendarId=cal_id, body=body).execute()
+        app.logger.info(f"[Calendar] Inserted event id={ev.get('id')}")
+        _tx("gcal.upsert", "success", booking=br, member=br.member, target=ev.get("id"), meta={"mode": "insert"})
+        return True, ev.get("id")
+
+    except Exception as e:
+        app.logger.error(f"[Calendar] Upsert failed: {e!r}")
+        _tx("gcal.upsert", "error", booking=br, member=br.member, target=br.calendar_event_id or "", meta={"error": repr(e), "mode":"upsert"})
+        return False, f"upsert exception: {e!r}"
 
 def remove_event_from_calendar(event_id):
-    calendar_id = os.getenv("GOOGLE_CALENDAR_ID")
-    if not (calendar_id and event_id and GOOGLE_OK):
-        return False
-    creds = _get_google_creds()
-    if not creds:
+    svc, cal_id = _calendar_service()
+    if not svc or not cal_id or not event_id:
         return False
     try:
-        service = build("calendar", "v3", credentials=creds)
-        service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
-        print(f"[Calendar] Deleted event id={event_id}")
+        svc.events().delete(calendarId=cal_id, eventId=event_id).execute()
+        app.logger.info(f"[Calendar] Deleted event id={event_id}")
         return True
+    except HttpError as he:
+        # Consider 404 a success (already deleted)
+        if getattr(he, "status_code", None) == 404 or "Not Found" in str(he):
+            app.logger.info(f"[Calendar] Event id={event_id} already gone.")
+            return True
+        app.logger.error(f"[Calendar] Delete failed: {he!r}")
+        return False
     except Exception as e:
-        print(f"[Calendar] Failed to delete event: {e}")
+        app.logger.error(f"[Calendar] Delete exception: {e!r}")
         return False
 
 # -----------------------------
 # Overlap helpers (strict END-EXCLUSIVE + normalization)
 # -----------------------------
 def _as_date(d):
-    """Coerce incoming values to a date (strip any time component)."""
     if isinstance(d, date) and not isinstance(d, datetime):
         return d
     if isinstance(d, datetime):
@@ -728,17 +707,11 @@ def _as_date(d):
         return d
 
 def ranges_overlap(a_start, a_end, b_start, b_end):
-    """
-    End-exclusive overlap:
-      [a_start, a_end) overlaps [b_start, b_end)  iff  (a_start < b_end) and (b_start < a_end)
-    Allows back-to-back: a_end == b_start or b_end == a_start → NOT overlap.
-    """
     a_start, a_end = _as_date(a_start), _as_date(a_end)
     b_start, b_end = _as_date(b_start), _as_date(b_end)
     return (a_start < b_end) and (b_start < a_end)
 
 def find_conflicts(start_date, end_date, exclude_request_id=None):
-    """SQL-native overlap: [s,e) overlaps [start_date,end_date) ⇢ start_date < e AND s < end_date"""
     s, e = _as_date(start_date), _as_date(end_date)
     q = BookingRequest.query.filter(
         BookingRequest.status == "approved",
@@ -904,7 +877,7 @@ def dashboard():
     return render_template("dashboard.html", me=m, upcoming=upcoming, pending=pending)
 
 # -----------------------------
-# Request form + aliases (client+server blocking, end-day allowed)
+# Request form + aliases
 # -----------------------------
 def _request_form_handler():
     me = current_member()
@@ -918,16 +891,14 @@ def _request_form_handler():
         form.member_type.data = me.member_type
 
     if form.validate_on_submit():
-        # Normalize inputs to pure dates
         s = _as_date(form.start_date.data)
         e = _as_date(form.end_date.data)
 
-        # Server: end must be after start (1+ nights)
         if not s or not e or e <= s:
             flash("End date must be after start date.", "danger")
             return render_template("request.html", form=form)
 
-        # Identify or create the member *before* overlap checks
+        # Identify or create the member before overlap checks
         member = me or Member.query.filter_by(email=form.email.data.strip().lower()).first()
         if not member:
             member = Member(
@@ -943,46 +914,30 @@ def _request_form_handler():
             member.phone = form.phone.data.strip() if form.phone.data else member.phone
             member.member_type = form.member_type.data
 
-        # Block overlaps with THIS member's own pending/approved requests (end-exclusive)
+        # Own overlaps (pending+approved)
         own_overlaps = find_member_conflicts(member.id, s, e)
         if own_overlaps:
-            detail = ", ".join(f"#{r.id} {r.start_date}→{r.end_date}" for r in own_overlaps)
-            print(f"[OWN OVERLAP DEBUG] new={s}→{e} conflicts={detail}")
             c = own_overlaps[0]
-            flash(
-                f"These dates overlap your own request #{c.id} ({c.start_date} → {c.end_date}). "
-                "Back-to-back is allowed, but no interior overlap.",
-                "danger"
-            )
+            app.logger.info(f"[OWN OVERLAP DEBUG] new={s}→{e} conflicts={[ (r.id, r.start_date, r.end_date) for r in own_overlaps ]}")
+            flash(f"These dates overlap your own request #{c.id} ({c.start_date} → {c.end_date}). Back-to-back is allowed, but no interior overlap.", "danger")
             db.session.rollback()
             return render_template("request.html", form=form)
 
-        # Block overlaps vs APPROVED requests (any member), end-exclusive
+        # Approved overlaps (any member)
         overlaps = find_conflicts(s, e)
         if overlaps:
-            detail = ", ".join(f"#{r.id} {r.start_date}→{r.end_date}" for r in overlaps)
-            print(f"[OVERLAP DEBUG] new={s}→{e} conflicts={detail}")
             c = overlaps[0]
-            flash(
-                f"Those dates overlap an existing approved booking #{c.id} ({c.start_date} → {c.end_date}). "
-                "Note: end days can touch the next start day.",
-                "danger"
-            )
+            app.logger.info(f"[OVERLAP DEBUG] new={s}→{e} conflicts={[ (r.id, r.start_date, r.end_date) for r in overlaps ]}")
+            flash(f"Those dates overlap an existing approved booking #{c.id} ({c.start_date} → {c.end_date}). Note: end days can touch the next start day.", "danger")
             db.session.rollback()
             return render_template("request.html", form=form)
 
         # Create the booking request
-        br = BookingRequest(
-            member_id=member.id,
-            start_date=s,
-            end_date=e,
-            notes=form.notes.data
-        )
+        br = BookingRequest(member_id=member.id, start_date=s, end_date=e, notes=form.notes.data)
         db.session.add(br)
         db.session.commit()
         _snapshot_booking(br)
 
-        # Receipts / admin alert
         try:
             send_email(member.email,
                        "Lake House request received",
@@ -1018,7 +973,7 @@ def request_new_old():
     return _request_form_handler()
 
 # -----------------------------
-# Booked dates APIs (end-exclusive interiors)
+# Booked dates APIs
 # -----------------------------
 @app.get("/api/booked-dates")
 def api_booked_dates():
@@ -1029,7 +984,7 @@ def api_booked_dates():
     blocked = set()
     for s, e in rows:
         d = s
-        while d < e:  # stop BEFORE e so end-day is free for back-to-back bookings
+        while d < e:  # stop BEFORE e so end-day is free
             blocked.add(d.isoformat())
             d += timedelta(days=1)
     return jsonify(sorted(blocked))
@@ -1047,7 +1002,7 @@ def api_my_blocked_dates():
     blocked = set()
     for s, e in rows:
         d = s
-        while d < e:  # end-exclusive
+        while d < e:
             blocked.add(d.isoformat())
             d += timedelta(days=1)
     return jsonify(sorted(blocked))
@@ -1088,8 +1043,7 @@ def calendar_ics():
         uid = f"lakehouse-{r.id}@example.local"
         dtstamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         dtstart = r.start_date.strftime("%Y%m%d")
-        # DB end is exclusive; ICS all-day DTEND is exclusive as well → use as-is
-        dtend = r.end_date.strftime("%Y%m%d")
+        dtend = r.end_date.strftime("%Y%m%d")  # already exclusive
         summary = esc(f"Lake House: {r.member.name} ({r.member.member_type})")
         desc = esc((r.notes or "") + f"\\nMember email: {r.member.email}")
         ev = [
@@ -1166,32 +1120,31 @@ def approve_request(req_id):
         return redirect(url_for("admin_login"))
     br = BookingRequest.query.get_or_404(req_id)
 
-    # Re-check overlaps strictly end-exclusive (exclude this req id)
+    # Re-check overlaps end-exclusive (exclude this req id)
     conflicts = find_conflicts(br.start_date, br.end_date, exclude_request_id=br.id)
     if conflicts:
         conflict_list = ", ".join(f"{c.member.name}({c.start_date}→{c.end_date})" for c in conflicts)
         flash(f"Cannot approve: date conflict with {conflict_list}.", "danger")
         return redirect(url_for("admin_requests"))
 
-    # Approve
+    # Approve in DB first
     br.status = "approved"
     db.session.commit()
 
-    # Create Google Calendar event on approval
-    summary = f"Lake House: {br.member.name} ({br.member.member_type})"
-    description = (br.notes or "") + f"\nMember email: {br.member.email}"
-    ev_id = add_event_to_calendar(summary, br.start_date, br.end_date, description)
-    if ev_id:
-        br.calendar_event_id = ev_id
-        db.session.commit()
-        _tx("gcal.insert", "success", booking=br, member=br.member, target=ev_id, meta={"summary": summary})
+    # Upsert Calendar
+    ok, eid_or_reason = upsert_event_to_calendar(br)
+    if ok:
+        if br.calendar_event_id != eid_or_reason:
+            br.calendar_event_id = eid_or_reason
+            db.session.commit()
+        _tx("gcal.upsert", "success", booking=br, member=br.member, target=eid_or_reason, meta={"action":"approve"})
     else:
-        _tx("gcal.insert", "error", booking=br, member=br.member, target="", meta={"reason": "insert failed"})
+        _tx("gcal.upsert", "error", booking=br, member=br.member, target="", meta={"reason": eid_or_reason})
+        app.logger.warning(f"[Calendar] Upsert on approve failed: {eid_or_reason}")
 
     _snapshot_booking(br)
     _notify_status(br)
 
-    # Admin alert on approval
     try:
         admin_email = os.getenv("ADMIN_EMAIL")
         if admin_email:
@@ -1201,7 +1154,7 @@ def approve_request(req_id):
     except Exception:
         pass
 
-    _log("approve", br.id, "Approved")
+    _log("approve", br.id, f"Approved; calendar={'ok' if ok else 'error'}")
     flash("Request approved.", "success")
     return redirect(url_for("admin_requests"))
 
@@ -1214,8 +1167,7 @@ def deny_request(req_id):
     if br.calendar_event_id:
         ok = remove_event_from_calendar(br.calendar_event_id)
         _tx("gcal.delete", "success" if ok else "error", booking=br, member=br.member, target=br.calendar_event_id)
-        if ok:
-            br.calendar_event_id = None
+        if ok: br.calendar_event_id = None
 
     br.status = "denied"
     db.session.commit()
@@ -1234,8 +1186,7 @@ def cancel_request(req_id):
     if br.calendar_event_id:
         ok = remove_event_from_calendar(br.calendar_event_id)
         _tx("gcal.delete", "success" if ok else "error", booking=br, member=br.member, target=br.calendar_event_id)
-        if ok:
-            br.calendar_event_id = None
+        if ok: br.calendar_event_id = None
 
     br.status = "cancelled"
     db.session.commit()
@@ -1243,6 +1194,26 @@ def cancel_request(req_id):
     _notify_status(br)
     _log("cancel", br.id, "Cancelled by admin")
     flash("Request cancelled.", "warning")
+    return redirect(url_for("admin_requests"))
+
+@app.post("/admin/requests/<int:req_id>/resync")
+def resync_request(req_id):
+    if not is_admin():
+        return redirect(url_for("admin_login"))
+    br = BookingRequest.query.get_or_404(req_id)
+    if br.status != "approved":
+        flash("Only approved bookings are synced to the calendar.", "warning")
+        return redirect(url_for("admin_requests"))
+
+    ok, eid_or_reason = upsert_event_to_calendar(br)
+    if ok:
+        br.calendar_event_id = eid_or_reason
+        db.session.commit()
+        _log("resync", br.id, "Calendar resync ok")
+        flash("Calendar resynced.", "success")
+    else:
+        _log("resync", br.id, f"Calendar resync failed: {eid_or_reason}")
+        flash(f"Calendar resync failed: {eid_or_reason}", "danger")
     return redirect(url_for("admin_requests"))
 
 # -----------------------------
@@ -1254,33 +1225,7 @@ def _routes():
     for r in app.url_map.iter_rules():
         methods = ",".join(sorted(m for m in r.methods if m not in ("HEAD","OPTIONS")))
         rules.append({"rule": str(r), "endpoint": r.endpoint, "methods": methods})
-        # /_routes is handy to confirm endpoints exist in prod
     return jsonify(sorted(rules, key=lambda x: x["rule"]))
-
-@app.get("/_test_overlap")
-def _test_overlap():
-    """
-    Try: /_test_overlap?s=2025-09-05&e=2025-09-07
-    Returns both SQL and Python-calculated conflicts for quick debugging.
-    """
-    s = _as_date(request.args.get("s"))
-    e = _as_date(request.args.get("e"))
-    if not s or not e:
-        return jsonify({"error": "pass ?s=YYYY-MM-DD&e=YYYY-MM-DD"}), 400
-    if e <= s:
-        return jsonify({"error": "end must be after start (exclusive)"}), 400
-
-    sql_hits = find_conflicts(s, e)
-    py_hits = [r for r in BookingRequest.query.filter_by(status="approved").all()
-               if ranges_overlap(s, e, r.start_date, r.end_date)]
-    out_sql = [{"id": r.id, "start": r.start_date.isoformat(), "end": r.end_date.isoformat()} for r in sql_hits]
-    out_py  = [{"id": r.id, "start": r.start_date.isoformat(), "end": r.end_date.isoformat()} for r in py_hits]
-    print(f"[TEST OVERLAP] new={s}→{e} sql={out_sql} python={out_py}")
-    return jsonify({
-        "range": [s.isoformat(), e.isoformat()],
-        "sql_conflicts": out_sql,
-        "python_conflicts": out_py,
-    })
 
 @app.route("/_diag")
 def _diag():
@@ -1293,6 +1238,14 @@ def _diag():
             "has_templates_dir": TEMPLATES_DIR.is_dir(),
             "templates_list": sorted(p.name for p in TEMPLATES_DIR.glob("*")) if TEMPLATES_DIR.is_dir() else [],
             "files_in_cwd": sorted(os.listdir(".")),
+            "calendar_config": {
+                "GOOGLE_OK": GOOGLE_OK,
+                "GOOGLE_CALENDAR_ID_set": bool(os.getenv("GOOGLE_CALENDAR_ID")),
+                "has_token_json": (BASE_DIR / "token.json").exists(),
+                "has_service_account_json_env": bool(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")),
+                "has_service_account_file_env": bool(os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")),
+                "impersonate": os.getenv("GOOGLE_IMPERSONATE") or "",
+            },
         })
     except Exception as e:
         return {"error": repr(e)}, 500
