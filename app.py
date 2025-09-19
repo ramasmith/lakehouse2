@@ -1,4 +1,8 @@
-# app.py — Lake House bookings (fix false overlaps: strict end-exclusive + date normalization)
+# app.py — Lake House bookings
+# Fix: allow start/end “touching” bookings (end-exclusive). Only disable blocked days on START picker.
+# Keeps: self-healing templates, calendar page, own-request warnings, Google Calendar sync,
+# user receipt + admin alerts, SMTP/Twilio DRY-RUN, exports, etc.
+
 import os, sys, json, csv, socket
 from io import StringIO
 from pathlib import Path
@@ -159,10 +163,11 @@ class SignupForm(FlaskForm):
     submit = SubmitField("Create account")
 
 # -----------------------------
-# Templates (Flatpickr + lake vibe)
+# Self-healing templates
 # -----------------------------
 DEFAULT_TEMPLATES = {
-    "base.html": r"""<!-- LAKEHOUSE_BASE_V6 -->
+    # version bump to refresh template on disk
+    "base.html": r"""<!-- LAKEHOUSE_BASE_V7 -->
 <!doctype html>
 <html lang="en">
 <head>
@@ -173,7 +178,9 @@ DEFAULT_TEMPLATES = {
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
 
   <style>
-    :root{ --lake-blue:#3aa4c4; --pine:#1b3a3a; --sand:#f9f6ef; --sun:#ffd166; --text:#0f172a; }
+    :root{
+      --lake-blue:#3aa4c4; --pine:#1b3a3a; --sand:#f9f6ef; --sun:#ffd166; --text:#0f172a;
+    }
     body{ background: linear-gradient(180deg, var(--sand) 0%, #ffffff 80%); color: var(--text); }
     nav{ background: linear-gradient(90deg, var(--lake-blue), #7fd3e7); border-radius: 16px; padding: .75rem 1rem; }
     nav a{ color:#083344; font-weight:600; }
@@ -183,15 +190,21 @@ DEFAULT_TEMPLATES = {
     .btn-primary{ background: var(--lake-blue); border:none; }
     .tag{ padding:.15rem .4rem; border-radius:999px; background:#eef2f7; color:#475569; font-size:.75rem;}
     footer{ color:#64748b; font-size:.9rem; }
-    .flatpickr-day.disabled, .flatpickr-day.disabled:hover{
-      background:#f1f5f9; color:#94a3b8 !important; cursor:not-allowed; text-decoration: line-through;
+    .flatpickr-day.disabled,
+    .flatpickr-day.disabled:hover{
+      background:#f1f5f9;
+      color:#94a3b8 !important;
+      cursor:not-allowed;
+      text-decoration: line-through;
     }
   </style>
 </head>
 <body>
   <main class="container">
     <nav>
-      <ul><li class="brand"><span class="dot"></span>Lake House Bookings</li></ul>
+      <ul>
+        <li class="brand"><span class="dot"></span>Lake House Bookings</li>
+      </ul>
       <ul>
         <li><a href="{{ url_for('calendar_view') }}">Calendar</a></li>
         {% if session.get('user_member_id') %}
@@ -223,58 +236,105 @@ DEFAULT_TEMPLATES = {
 
     {% block content %}{% endblock %}
 
-    <footer style="margin-top:3rem">Built with Flask • Conflict detection • ICS feed • Accounts</footer>
+    <footer style="margin-top:3rem">
+      Built with Flask • Conflict detection • ICS feed • Accounts
+    </footer>
   </main>
 
   <!-- Flatpickr -->
   <script src="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.js"></script>
   <script>
-    function fmtLocalYMD(d){ const p=n=>String(n).padStart(2,'0'); return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate()); }
+    // local YYYY-MM-DD (avoid UTC shift)
+    function fmtLocalYMD(d){
+      const pad = n => String(n).padStart(2,'0');
+      return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate());
+    }
 
-    // Calendar initializer — greys out CONFIRMED interior days; warns on user's own overlap
+    // Calendar initializer
+    // - Greys out CONFIRMED interior days on START picker only
+    // - END picker stays free so users can set end == other.start (end-exclusive)
+    // - Submit-time scan still blocks any interior overlap in [start, end)
+    // - Warns on user's own pending/approved overlaps
     async function initLakeDatepickers() {
-      const pickers = document.querySelectorAll("input.datepicker");
-      if (!pickers.length) return;
+      const startEl = document.querySelector("input[name='start_date']");
+      const endEl   = document.querySelector("input[name='end_date']");
+      if (!startEl && !endEl) return;
 
-      let confirmed = []; let mine = [];
-      try { const r = await fetch("{{ url_for('api_booked_dates') }}", {cache:"no-store"}); confirmed = await r.json(); } catch {}
-      try { const r2 = await fetch("{{ url_for('api_my_blocked_dates') }}", {cache:"no-store"}); if (r2.ok) mine = await r2.json(); } catch {}
+      let confirmedBlocked = [];
+      let myBlocked = [];
+      try {
+        const r = await fetch("{{ url_for('api_booked_dates') }}", {cache:"no-store"});
+        confirmedBlocked = await r.json();
+      } catch(e) { console.warn("blocked fetch fail", e); }
+      try {
+        const r2 = await fetch("{{ url_for('api_my_blocked_dates') }}", {cache:"no-store"});
+        if (r2.ok) myBlocked = await r2.json();
+      } catch(e) { console.warn("my-blocked fetch fail", e); }
 
-      const confirmedSet = new Set(confirmed);
-      const mySet = new Set(mine);
+      const confirmedSet = new Set(confirmedBlocked);
+      const mySet = new Set(myBlocked);
 
-      function isConfirmedBlocked(d){ return confirmedSet.has(fmtLocalYMD(d)); }
-      function onChangeCheck(sel, _s, fp){
+      function isConfirmedBlocked(date){ return confirmedSet.has(fmtLocalYMD(date)); }
+      function onChangeCheckStart(sel, _s, fp){
         if (!sel.length) return;
         const iso = fmtLocalYMD(sel[0]);
-        if (confirmedSet.has(iso)) { alert("That date is already booked. Please pick another date."); fp.clear(); }
+        if (confirmedSet.has(iso)) { alert("That start date is already booked. Please pick another start."); fp.clear(); }
       }
 
-      const opts = { dateFormat:"Y-m-d", minDate:"today", disable:[isConfirmedBlocked], onChange:onChangeCheck };
-      pickers.forEach(el => { el.setAttribute("type","text"); el._fp = flatpickr(el, opts); });
+      // Force text inputs
+      if (startEl) startEl.setAttribute("type","text");
+      if (endEl)   endEl.setAttribute("type","text");
 
-      const s = document.querySelector("input[name='start_date']");
-      const e = document.querySelector("input[name='end_date']");
+      // START picker: disable confirmed interiors
+      if (startEl) {
+        startEl._fp = flatpickr(startEl, {
+          dateFormat: "Y-m-d",
+          minDate: "today",
+          disable: [isConfirmedBlocked],
+          onChange: onChangeCheckStart
+        });
+      }
+      // END picker: do NOT disable days (so end == other.start is selectable)
+      if (endEl) {
+        endEl._fp = flatpickr(endEl, {
+          dateFormat: "Y-m-d",
+          minDate: "today"
+        });
+      }
+
+      // Cross-field checks: end > start
       function enforceRange(){
-        const sv = s && s.value ? new Date(s.value) : null;
-        const ev = e && e.value ? new Date(e.value) : null;
-        if (sv && ev && ev <= sv) { alert("End date must be AFTER start date."); e.value=""; if (e._fp) e._fp.clear(); }
+        const sv = startEl && startEl.value ? new Date(startEl.value) : null;
+        const ev = endEl   && endEl.value   ? new Date(endEl.value)   : null;
+        if (sv && ev && ev <= sv) {
+          alert("End date must be AFTER start date.");
+          endEl.value = "";
+          if (endEl._fp) endEl._fp.clear();
+        }
       }
-      if (s) s.addEventListener("change", enforceRange);
-      if (e) e.addEventListener("change", enforceRange);
+      if (startEl) startEl.addEventListener("change", enforceRange);
+      if (endEl)   endEl.addEventListener("change", enforceRange);
 
+      // Submit-time guard: check interiors [start, end)
       const form = document.querySelector("form[data-validate='booking']");
       if (form) {
         form.addEventListener("submit", (evt) => {
-          const sv = s && s.value ? new Date(s.value) : null;
-          const ev = e && e.value ? new Date(e.value) : null;
+          const sv = startEl && startEl.value ? new Date(startEl.value) : null;
+          const ev = endEl   && endEl.value   ? new Date(endEl.value)   : null;
           if (!sv || !ev) return;
           if (ev <= sv) { alert("End date must be AFTER start date."); evt.preventDefault(); return; }
-          let cur = new Date(s.value); const end = new Date(e.value);
-          while (cur < end) {
+          let cur = new Date(startEl.value);
+          const end = new Date(endEl.value);
+          while (cur < end) { // end-exclusive
             const iso = fmtLocalYMD(cur);
-            if (confirmedSet.has(iso)) { alert("Overlaps a confirmed booking ("+iso+"). Please choose different dates."); evt.preventDefault(); return; }
-            if (mySet.has(iso)) { alert("You already have a request including "+iso+". Please choose different dates."); evt.preventDefault(); return; }
+            if (confirmedSet.has(iso)) {
+              alert("Your selection overlaps a confirmed booking on " + iso + ". Please adjust.");
+              evt.preventDefault(); return;
+            }
+            if (mySet.has(iso)) {
+              alert("You already have a request that includes " + iso + ". Please choose non-overlapping dates.");
+              evt.preventDefault(); return;
+            }
             cur.setDate(cur.getDate()+1);
           }
         });
@@ -468,12 +528,16 @@ DEFAULT_TEMPLATES = {
 }
 
 def _ensure_templates_present():
+    """
+    Write templates if missing; optionally force refresh with FORCE_TEMPLATE_REFRESH=1
+    or if the version marker is missing.
+    """
     try:
         TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
         force = os.getenv("FORCE_TEMPLATE_REFRESH", "0") == "1"
         for name, content in DEFAULT_TEMPLATES.items():
             p = TEMPLATES_DIR / name
-            if force or (not p.exists()) or ("LAKEHOUSE_BASE_V6" in content and "LAKEHOUSE_BASE_V6" not in (p.read_text(encoding="utf-8") if p.exists() else "")):
+            if force or (not p.exists()) or ("LAKEHOUSE_BASE_V7" in content and "LAKEHOUSE_BASE_V7" not in (p.read_text(encoding="utf-8") if p.exists() else "")):
                 p.write_text(content, encoding="utf-8")
                 app.logger.info(f"[bootstrap] wrote template: {p}")
     except Exception as e:
@@ -653,17 +717,16 @@ def _as_date(d):
         return d
     if isinstance(d, datetime):
         return d.date()
-    # fallback: try to parse 'YYYY-MM-DD'
     try:
         return datetime.strptime(str(d), "%Y-%m-%d").date()
     except Exception:
-        return d  # let it fail upstream if unusable
+        return d
 
 def ranges_overlap(a_start, a_end, b_start, b_end):
     """
     End-exclusive overlap:
       [a_start, a_end) overlaps [b_start, b_end)  iff  (a_start < b_end) and (b_start < a_end)
-    This correctly allows back-to-back (a_end == b_start or b_end == a_start).
+    Allows back-to-back: a_end == b_start or b_end == a_start → NOT overlap.
     """
     a_start, a_end = _as_date(a_start), _as_date(a_end)
     b_start, b_end = _as_date(b_start), _as_date(b_end)
@@ -674,11 +737,7 @@ def find_conflicts(start_date, end_date, exclude_request_id=None):
     q = BookingRequest.query.filter(BookingRequest.status == "approved")
     if exclude_request_id:
         q = q.filter(BookingRequest.id != exclude_request_id)
-    out = []
-    for r in q.all():
-        if ranges_overlap(s, e, r.start_date, r.end_date):
-            out.append(r)
-    return out
+    return [r for r in q.all() if ranges_overlap(s, e, r.start_date, r.end_date)]
 
 def find_member_conflicts(member_id, start_date, end_date, exclude_request_id=None):
     s, e = _as_date(start_date), _as_date(end_date)
@@ -688,11 +747,7 @@ def find_member_conflicts(member_id, start_date, end_date, exclude_request_id=No
     )
     if exclude_request_id:
         q = q.filter(BookingRequest.id != exclude_request_id)
-    out = []
-    for r in q.all():
-        if ranges_overlap(s, e, r.start_date, r.end_date):
-            out.append(r)
-    return out
+    return [r for r in q.all() if ranges_overlap(s, e, r.start_date, r.end_date)]
 
 def _log(action, request_id, details=""):
     db.session.add(AuditLog(action=action, request_id=request_id, admin_email=current_admin_email(), details=details))
@@ -851,7 +906,7 @@ def _request_form_handler():
         form.member_type.data = me.member_type
 
     if form.validate_on_submit():
-        # Normalize inputs to pure dates (extra safety)
+        # Normalize inputs to pure dates
         s = _as_date(form.start_date.data)
         e = _as_date(form.end_date.data)
 
@@ -879,10 +934,9 @@ def _request_form_handler():
         # Block overlaps with THIS member's own pending/approved requests (end-exclusive)
         own_overlaps = find_member_conflicts(member.id, s, e)
         if own_overlaps:
-            # Show first conflict details to explain why
             c = own_overlaps[0]
             flash(f"These dates overlap your own request ({c.start_date} → {c.end_date}). Back-to-back is allowed, but no interior overlap.", "danger")
-            db.session.rollback()  # undo any prefills we made above
+            db.session.rollback()
             return render_template("request.html", form=form)
 
         # Block overlaps vs APPROVED requests (any member), end-exclusive
@@ -904,7 +958,7 @@ def _request_form_handler():
         db.session.commit()
         _snapshot_booking(br)
 
-        # Optional receipts/alerts (kept from previous versions)
+        # Receipts / admin alert
         try:
             send_email(member.email,
                        "Lake House request received",
@@ -914,7 +968,7 @@ def _request_form_handler():
                 send_email(admin_email,
                            "New Lake House request pending",
                            f"Member: {member.name} <{member.email}>\nDates: {s} → {e}\nNotes: {form.notes.data or '-'}")
-        except Exception as _e:
+        except Exception:
             pass
 
         flash("Request submitted! You’ll receive an email confirmation.", "success")
@@ -1112,7 +1166,7 @@ def approve_request(req_id):
     _snapshot_booking(br)
     _notify_status(br)
 
-    # Optional: alert admin mailbox about approval
+    # Admin alert on approval
     try:
         admin_email = os.getenv("ADMIN_EMAIL")
         if admin_email:
