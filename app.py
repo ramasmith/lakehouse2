@@ -292,6 +292,7 @@ DEFAULT_TEMPLATES = {
 <p>Already have an account? <a href="{{ url_for('signin') }}">Sign in</a></p>
 {% endblock %}""",
 
+    # UPDATED dashboard: adds Cancel buttons (user self-service)
     "dashboard.html": r"""{% extends "base.html" %}
 {% block content %}
 <section class="card" style="padding:1rem; margin-top:1rem;">
@@ -300,10 +301,18 @@ DEFAULT_TEMPLATES = {
   <h3>Upcoming (approved)</h3>
   {% if upcoming %}
   <table role="grid">
-    <thead><tr><th>Dates</th><th>Notes</th></tr></thead>
+    <thead><tr><th>Dates</th><th>Notes</th><th>Actions</th></tr></thead>
     <tbody>
       {% for r in upcoming %}
-        <tr><td>{{ r.start_date }} → {{ r.end_date }}</td><td>{{ r.notes or '' }}</td></tr>
+        <tr>
+          <td>{{ r.start_date }} → {{ r.end_date }}</td>
+          <td>{{ r.notes or '' }}</td>
+          <td>
+            <form method="POST" action="{{ url_for('user_cancel_request', req_id=r.id) }}" onsubmit="return confirm('Cancel this booking? This will remove it from the calendar.');" style="display:inline;">
+              <button class="contrast">Cancel</button>
+            </form>
+          </td>
+        </tr>
       {% endfor %}
     </tbody>
   </table>
@@ -312,13 +321,18 @@ DEFAULT_TEMPLATES = {
   <h3>Pending</h3>
   {% if pending %}
   <table role="grid">
-    <thead><tr><th>Dates</th><th>Notes</th><th>Created</th></tr></thead>
+    <thead><tr><th>Dates</th><th>Notes</th><th>Created</th><th>Actions</th></tr></thead>
     <tbody>
       {% for r in pending %}
         <tr>
           <td>{{ r.start_date }} → {{ r.end_date }}</td>
           <td>{{ r.notes or '' }}</td>
           <td><small>{{ r.created_at.strftime('%Y-%m-%d %H:%M') }}</small></td>
+          <td>
+            <form method="POST" action="{{ url_for('user_cancel_request', req_id=r.id) }}" onsubmit="return confirm('Cancel this pending request?');" style="display:inline;">
+              <button class="secondary">Cancel</button>
+            </form>
+          </td>
         </tr>
       {% endfor %}
     </tbody>
@@ -329,25 +343,6 @@ DEFAULT_TEMPLATES = {
     <a class="btn-primary" href="{{ url_for('request_booking') }}">Request another stay</a>
   </div>
 </section>
-{% endblock %}""",
-
-    "request.html": r"""{% extends "base.html" %}
-{% block content %}
-<h2>Request time at the Lake House</h2>
-<form method="POST" class="card" style="padding:1rem;" data-validate="booking">
-  {{ form.hidden_tag() }}
-  <div class="grid">
-    <label>{{ form.name.label }} {{ form.name(size=32) }}</label>
-    <label>{{ form.email.label }} {{ form.email(size=32) }}</label>
-    <label>{{ form.phone.label }} {{ form.phone(size=20) }}</label>
-    <label>{{ form.member_type.label }} {{ form.member_type() }}</label>
-    <label>{{ form.start_date.label }} {{ form.start_date(class_="datepicker", type="text", placeholder="YYYY-MM-DD") }}</label>
-    <label>{{ form.end_date.label }} {{ form.end_date(class_="datepicker", type="text", placeholder="YYYY-MM-DD") }}</label>
-  </div>
-  <label>{{ form.notes.label }} {{ form.notes(rows=3) }}</label>
-  <label>{{ form.subscribe_sms() }} {{ form.subscribe_sms.label }}</label>
-  <button class="btn-primary" type="submit">Submit Request</button>
-</form>
 {% endblock %}""",
 
     "admin_login.html": r"""{% extends "base.html" %}
@@ -875,6 +870,56 @@ def dashboard():
                .order_by(BookingRequest.created_at.desc())
                .all())
     return render_template("dashboard.html", me=m, upcoming=upcoming, pending=pending)
+
+# -----------------------------
+# USER: Cancel own booking/request
+# -----------------------------
+@app.post("/me/requests/<int:req_id>/cancel")
+def user_cancel_request(req_id):
+    me = current_member()
+    if not me:
+        flash("Please sign in to manage your requests.", "warning")
+        return redirect(url_for("signin"))
+
+    br = BookingRequest.query.get_or_404(req_id)
+    if br.member_id != me.id:
+        flash("You can only cancel your own requests.", "danger")
+        return redirect(url_for("dashboard"))
+
+    # Prevent canceling past/finished bookings
+    if br.end_date <= date.today():
+        flash("This stay has already ended and cannot be cancelled.", "warning")
+        return redirect(url_for("dashboard"))
+
+    # Remove calendar event if present
+    if br.calendar_event_id:
+        ok = remove_event_from_calendar(br.calendar_event_id)
+        _tx("gcal.delete", "success" if ok else "error", booking=br, member=br.member, target=br.calendar_event_id)
+        if ok:
+            br.calendar_event_id = None
+
+    prev_status = br.status
+    br.status = "cancelled"
+    db.session.commit()
+
+    _snapshot_booking(br)
+    _notify_status(br)  # Notifies the member that status is now "cancelled"
+    _log("cancel", br.id, f"Cancelled by member ({me.email}); was {prev_status}")
+
+    # Notify admin (optional)
+    try:
+        admin_email = os.getenv("ADMIN_EMAIL")
+        if admin_email:
+            send_email(admin_email,
+                       "Booking cancelled by member",
+                       f"Member: {me.name} <{me.email}>\n"
+                       f"Request #{br.id}\nDates: {br.start_date} → {br.end_date}\n"
+                       f"Previous status: {prev_status}")
+    except Exception:
+        pass
+
+    flash("Your request was cancelled.", "warning")
+    return redirect(url_for("dashboard"))
 
 # -----------------------------
 # Request form + aliases
