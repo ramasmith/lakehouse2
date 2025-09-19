@@ -683,7 +683,8 @@ def add_event_to_calendar(summary, start_date, end_date, description=""):
             "summary": summary,
             "description": description,
             "start": {"date": start_date.isoformat()},
-            "end": {"date": (end_date + timedelta(days=1)).isoformat()},  # all-day, exclusive end
+            #"end": {"date": (end_date + timedelta(days=1)).isoformat()},  # all-day, exclusive end
+            "end": {"date": end_date.isoformat()},  # DB end is already exclusive
         }
         event = service.events().insert(calendarId=calendar_id, body=event_body).execute()
         print(f"[Calendar] Inserted event id={event.get('id')}")
@@ -1064,7 +1065,8 @@ def calendar_ics():
         uid = f"lakehouse-{r.id}@example.local"
         dtstamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         dtstart = r.start_date.strftime("%Y%m%d")
-        dtend = (r.end_date + timedelta(days=1)).strftime("%Y%m%d")  # exclusive end
+       # dtend = (r.end_date + timedelta(days=1)).strftime("%Y%m%d")  # exclusive end
+        dtend = r.end_date.strftime("%Y%m%d")  # DB end is already exclusive
         summary = esc(f"Lake House: {r.member.name} ({r.member.member_type})")
         desc = esc((r.notes or "") + f"\\nMember email: {r.member.email}")
         ev = [
